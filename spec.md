@@ -2,7 +2,7 @@
 
 ## Intent
 
-Python's concurrency primitives are capable but cold. `concurrent.futures`
+Python's concurrency primitives are capable but cumbersome. `concurrent.futures`
 gives you threads and results; it does not give you a way to stop a hierarchy
 of running tasks, propagate that stop signal inward, or know — when something
 goes wrong three threads deep — what your program was actually trying to do
@@ -11,26 +11,21 @@ when it failed.
 `gentletask` is an attempt to fill those gaps without adding complexity that
 isn't earned. A gentle task doesn't spin up a thread it doesn't need. It
 communicates simply and honestly. When you ask it to stop, it stops — and it
-asks its children to stop too, then waits for them. It carries a thread of
+asks its children to stop too, then waits for them. It carries a narrative of
 meaning across every boundary it crosses so that your logs tell a story instead
 of a list of disconnected events.
 
 Two problems, two primitives:
 
 - **Stopability.** A `Task` can be stopped cooperatively. Stop signals propagate
-  down through hierarchies. The blocking primitives (`sleep`, `Queue`, `Event`)
-  all respect the stop signal, so you don't have to instrument every wait site
-  manually.
+  down through hierarchies. We provide replacement blocking primitives (`sleep`,
+  `Queue`, `Event`) to respect the stop signal, so you don't have to instrument
+  every wait site manually.
 
 - **Semantic context.** A `SemanticStack` carries labeled context — what your
   program is doing, not just where it is — across thread and process boundaries.
-  The module singleton is called `throughline`: one continuous thread of meaning
+  The module singleton is called `throughline`: a continuous thread of meaning
   running through all your concurrent execution.
-
-These two things are independent. `SemanticStack` has no opinion about tasks.
-Tasks have no opinion about what keys you put in your frames. They compose
-because the task machinery chooses to push frames, not because either one
-requires the other.
 
 ---
 
@@ -111,14 +106,14 @@ from gentletask import throughline
 
 All task machinery, logging filters, and user code share this one instance.
 Independent `SemanticStack` instances can be constructed for isolated concerns,
-but helpers like `current_task()` are tied to this singleton.
+but task-related helpers like `current_task()` are tied to this singleton.
 
 ---
 
 ## Thread transfer
 
 `ThreadTask` uses `contextvars.copy_context()` at construction time — the new
-thread inherits the current stack state automatically.
+thread inherits the current throughline stack state automatically.
 
 `WorkTask` calls `throughline.snapshot()` at `submit()` time. The snapshot
 captures the stack *as it exists when `submit()` is called* — this is
@@ -137,8 +132,13 @@ with throughline(name="request_handler"):
 worker.submit(job.run)
 ```
 
-The second pattern is a natural-looking refactor of the first. The behavior
-difference is correct and working-as-designed.
+---
+
+## Process transfer
+
+All values set by the gentletask library will be pickleable, and so long as your
+code adheres to that restriction, the throughline can be copied across process
+boundaries. `teleprox` makes use of this, as an example.
 
 ---
 
@@ -147,12 +147,12 @@ difference is correct and working-as-designed.
 ```python
 from gentletask import throughline
 
-with throughline(request_id="abc123", user="alice"):
+with throughline(operation="abc123", user="alice"):
     with throughline(operation="resize"):
-        throughline.collect("request_id")  # ("abc123",)
-        throughline.get("operation")       # "resize"
+        throughline.collect("operation")  # ("abc123", "resize)
+        throughline.get("user")       # "alice"
         throughline.frames()
-        # ({"request_id": "abc123", "user": "alice"},
+        # ({"operation": "abc123", "user": "alice"},
         #  {"operation": "resize"})
 ```
 
@@ -205,9 +205,9 @@ stops any still-running children unless they were explicitly detached.
 **`detach()`.** Removes this task from its parent's stop propagation. A
 subsequent `parent.stop()` will not cascade here.
 
-**`wait(timeout=None)`.** Polls in 50 ms intervals. If called from inside
-another task, checks whether that parent is stopped on each interval; if so,
-calls `self.stop()` and raises `Stopped`.
+**`wait(timeout=None, interval=0.05)`.** Polls in 50 ms intervals. If called
+from inside another task, checks whether that parent is stopped on each
+interval; if so, calls `self.stop()` and raises `Stopped`.
 
 **`__del__` cleanup.** A `ThreadTask` garbage-collected before `wait()` is
 called automatically calls `stop()` on itself and its children.
@@ -303,10 +303,9 @@ def task_chain() -> tuple[str, ...]:
     return throughline.collect("name")
 ```
 
-`TaskChainFilter` injects `throughline.collect("name")` into every log record
-as `task_chain`. Wire it to any `logging.Handler` to get structured ancestry in
-every log line. No direct `ContextVar` access anywhere outside `SemanticStack`
-itself.
+`ThroughlineNameFilter` injects `throughline.collect("name")` into every log
+record as `throughline`. Wire it to any `logging.Handler` to get structured
+ancestry in every log line.
 
 ---
 
