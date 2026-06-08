@@ -264,6 +264,32 @@ called automatically calls `stop()` on itself and its children.
 
 ---
 
+## `asynch` and `synch`
+
+`asynch(fn, ...)` returns a launcher: calling it starts `fn` in a `ThreadTask`
+and returns the task. It is the asynchronous wrapper.
+
+`synch(fn)` is its inverse — a de-wrapper. It returns a *synchronous* version
+of `fn`:
+
+- If `fn` was produced by `asynch()`, `synch` returns the original callable it
+  wraps. Calling that runs in the current thread and returns the value
+  directly, with no `ThreadTask`. Thus `synch(asynch(f)) is f`.
+- If `fn` is any other callable, it is already synchronous and is returned
+  unchanged.
+
+`synch` is therefore safe to apply regardless of whether a function was
+asynch-wrapped, which makes it useful at call sites that accept either form and
+just need to run the work and get a value.
+
+```python
+job = asynch(process)          # job(...) -> ThreadTask
+result = synch(job)(img)       # runs process(img) inline, returns the value
+result = synch(process)(img)   # same — process was already synchronous
+```
+
+---
+
 ## `WorkTask`
 
 Returned by `WorkerThread.submit()`. Represents one job queued to a long-lived

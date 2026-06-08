@@ -26,6 +26,7 @@ from gentletask import (
     current_task,
     poll,
     sleep,
+    synch,
     task_chain,
     task_context,
     throughline,
@@ -418,6 +419,48 @@ class TestAsynch:
         asynch(lambda: 1, on_finish=lambda r, e: done.append(r))()
         time.sleep(0.1)
         assert done == [1]
+
+
+# ---------------------------------------------------------------------------
+# synch — the inverse of asynch
+# ---------------------------------------------------------------------------
+
+
+class TestSynch:
+    def test_dewraps_asynch_to_original(self):
+        def fn():
+            return 1
+
+        assert synch(asynch(fn)) is fn
+
+    def test_dewraps_regardless_of_asynch_options(self):
+        def fn():
+            return 1
+
+        wrapped = asynch(fn, name="named", detach=True)
+        assert synch(wrapped) is fn
+
+    def test_plain_function_returned_unchanged(self):
+        def fn():
+            return 1
+
+        assert synch(fn) is fn
+
+    def test_synch_result_runs_synchronously(self):
+        # The de-wrapped callable returns the value directly, not a ThreadTask.
+        result = synch(asynch(lambda x, y: x + y))(3, 4)
+        assert result == 7
+
+    def test_synch_runs_in_current_thread(self):
+        # No new task is spawned: current_task() inside is whatever the caller's
+        # task is (None at top level).
+        seen = []
+        synch(asynch(lambda: seen.append(current_task())))()
+        assert seen == [None]
+
+    def test_idempotent_on_plain_function(self):
+        f = synch(asynch(lambda: 1))
+        assert synch(f) is f
 
 
 # ---------------------------------------------------------------------------

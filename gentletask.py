@@ -580,7 +580,21 @@ def asynch(
             fn, args, kwargs, name=name, detach=detach, on_finish=on_finish
         )
 
+    # Record the original callable so synch() can de-wrap back to it.
+    wrapper._asynch_wraps = fn
     return wrapper
+
+
+def synch(fn: Callable) -> Callable:
+    """Return a synchronous version of *fn*.
+
+    If *fn* was produced by asynch(), return the original callable it wraps —
+    calling that runs in the current thread and returns the value directly,
+    with no ThreadTask. If *fn* is any other callable it is already
+    synchronous and is returned unchanged. So ``synch(asynch(f)) is f``, and
+    synch is safe to apply whether or not a function was asynch-wrapped.
+    """
+    return getattr(fn, "_asynch_wraps", fn)
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +706,7 @@ __all__ = [
     "WorkTask",
     "WorkerThread",
     "asynch",
+    "synch",
     "task_context",
     "current_task",
     "task_chain",
