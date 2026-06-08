@@ -1,0 +1,676 @@
+# Tests for the gentletask v7 reference implementation.
+# Covers SemanticStack/throughline, ThreadTask, WorkTask, WorkerThread,
+# stop propagation, the stop-aware primitives, and the logging filter.
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+
+import queue as _queue
+import pytest
+
+from gentletask import (
+    Event,
+    Queue,
+    SemanticStack,
+    Stopped,
+    Task,
+    ThreadTask,
+    ThroughlineNameFilter,
+    WorkTask,
+    WorkerThread,
+    asynch,
+    check_stop,
+    current_task,
+    poll,
+    sleep,
+    task_chain,
+    throughline,
+)
+
+
+# ---------------------------------------------------------------------------
+# SemanticStack
+# ---------------------------------------------------------------------------
+
+
+class TestSemanticStack:
+    def test_get_innermost_wins(self):
+        s = SemanticStack()
+        with s(x=1):
+            with s(x=2):
+                assert s.get("x") == 2
+            assert s.get("x") == 1
+
+    def test_get_default_when_absent(self):
+        s = SemanticStack()
+        assert s.get("missing") is None
+        assert s.get("missing", "fallback") == "fallback"
+
+    def test_get_falls_through_frames(self):
+        s = SemanticStack()
+        with s(user="alice"):
+            with s(operation="resize"):
+                assert s.get("user") == "alice"
+                assert s.get("operation") == "resize"
+
+    def test_collect_outermost_first(self):
+        s = SemanticStack()
+        with s(name="outer"):
+            with s(name="inner"):
+                assert s.collect("name") == ("outer", "inner")
+
+    def test_collect_skips_frames_without_key(self):
+        s = SemanticStack()
+        with s(name="a"):
+            with s(other=1):
+                with s(name="b"):
+                    assert s.collect("name") == ("a", "b")
+
+    def test_collect_empty_when_absent(self):
+        s = SemanticStack()
+        with s(x=1):
+            assert s.collect("name") == ()
+
+    def test_walk_outermost_first(self):
+        s = SemanticStack()
+        with s(name="outer"):
+            with s(name="inner"):
+                assert s.walk(lambda f: f.get("name", "?")) == ("outer", "inner")
+
+    def test_walk_keeps_none_results(self):
+        s = SemanticStack()
+        with s(name="outer"):
+            with s(other=1):
+                assert s.walk(lambda f: f.get("name")) == ("outer", None)
+
+    def test_frames_returns_fresh_dicts(self):
+        s = SemanticStack()
+        with s(operation="abc123", user="alice"):
+            with s(operation="resize"):
+                frames = s.frames()
+                assert frames == (
+                    {"operation": "abc123", "user": "alice"},
+                    {"operation": "resize"},
+                )
+                # Mutating a returned dict must not corrupt the stack.
+                frames[0]["operation"] = "tampered"
+                assert s.get("user") == "alice"
+                assert s.collect("operation") == ("abc123", "resize")
+
+    def test_empty_stack(self):
+        s = SemanticStack()
+        assert s.frames() == ()
+        assert s.collect("anything") == ()
+        assert s.get("anything") is None
+
+    def test_independent_instances_are_isolated(self):
+        a = SemanticStack("a")
+        b = SemanticStack("b")
+        with a(name="in-a"):
+            assert a.collect("name") == ("in-a",)
+            assert b.collect("name") == ()
+
+    def test_frame_removed_on_exit(self):
+        s = SemanticStack()
+        with s(name="temp"):
+            assert s.collect("name") == ("temp",)
+        assert s.collect("name") == ()
+
+
+class TestSemanticSnapshot:
+    def test_restore_installs_captured_frames(self):
+        s = SemanticStack()
+        with s(name="captured"):
+            snap = s.snapshot()
+        # Outside the original frame the stack is empty again...
+        assert s.collect("name") == ()
+        # ...but restore brings the captured frames back.
+        with snap.restore():
+            assert s.collect("name") == ("captured",)
+        assert s.collect("name") == ()
+
+    def test_restore_replaces_existing_frames(self):
+        # Restoring into a thread that already has frames hides them for the
+        # duration of the block rather than merging.
+        s = SemanticStack()
+        with s(name="captured"):
+            snap = s.snapshot()
+        with s(name="live"):
+            assert s.collect("name") == ("live",)
+            with snap.restore():
+                assert s.collect("name") == ("captured",)
+            # Live frame comes back after the snapshot block ends.
+            assert s.collect("name") == ("live",)
+
+    def test_can_push_on_top_of_restored_snapshot(self):
+        s = SemanticStack()
+        with s(name="base"):
+            snap = s.snapshot()
+        with snap.restore():
+            with s(name="added"):
+                assert s.collect("name") == ("base", "added")
+            assert s.collect("name") == ("base",)
+
+
+# ---------------------------------------------------------------------------
+# Task Protocol
+# ---------------------------------------------------------------------------
+
+
+class TestTaskProtocol:
+    def test_thread_task_is_task(self):
+        t = ThreadTask(lambda: None)
+        t.wait()
+        assert isinstance(t, Task)
+
+    def test_work_task_is_task(self):
+        worker = WorkerThread()
+        wt = worker.submit(lambda: None)
+        wt.wait()
+        worker.stop()
+        assert isinstance(wt, Task)
+
+
+# ---------------------------------------------------------------------------
+# ThreadTask — basic behavior
+# ---------------------------------------------------------------------------
+
+
+class TestThreadTask:
+    def test_runs_fn_and_returns_result(self):
+        t = ThreadTask(lambda: 42)
+        assert t.wait() == 42
+
+    def test_result_property_blocks(self):
+        t = ThreadTask(lambda: "hello")
+        assert t.result == "hello"
+
+    def test_is_done_after_wait(self):
+        t = ThreadTask(lambda: None)
+        t.wait()
+        assert t.is_done
+
+    def test_exception_propagates_through_wait(self):
+        def boom():
+            raise ValueError("boom")
+
+        t = ThreadTask(boom)
+        with pytest.raises(ValueError, match="boom"):
+            t.wait()
+
+    def test_name_from_callable(self):
+        def my_func():
+            pass
+
+        t = ThreadTask(my_func)
+        t.wait()
+        assert t._name == my_func.__qualname__
+
+    def test_explicit_name(self):
+        t = ThreadTask(lambda: None, name="custom")
+        t.wait()
+        assert t._name == "custom"
+
+    def test_args_and_kwargs(self):
+        t = ThreadTask(lambda x, y=0: x + y, args=(3,), kwargs={"y": 4})
+        assert t.wait() == 7
+
+    def test_on_finish_callback(self):
+        results = []
+        t = ThreadTask(lambda: 7, on_finish=lambda r, e: results.append((r, e)))
+        t.wait()
+        assert results == [(7, None)]
+
+    def test_add_finish_callback(self):
+        results = []
+        t = ThreadTask(lambda: 5)
+        t.add_finish_callback(lambda r, e: results.append(r))
+        t.wait()
+        assert results == [5]
+
+    def test_add_finish_callback_after_done(self):
+        t = ThreadTask(lambda: 3)
+        t.wait()
+        results = []
+        t.add_finish_callback(lambda r, e: results.append(r))
+        assert results == [3]
+
+    def test_wait_timeout_returns_none(self):
+        barrier = threading.Event()
+        t = ThreadTask(barrier.wait)
+        result = t.wait(timeout=0.05)
+        barrier.set()
+        assert result is None
+
+    def test_stop_before_run_marks_stopped(self):
+        barrier = threading.Barrier(2)
+
+        def fn():
+            barrier.wait()
+
+        t = ThreadTask(fn)
+        t.stop()
+        barrier.wait()
+        t.wait(timeout=1.0)
+        assert t.is_stopped
+
+
+# ---------------------------------------------------------------------------
+# ThreadTask — stop propagation
+# ---------------------------------------------------------------------------
+
+
+class TestThreadTaskStop:
+    def test_stop_cascades_to_child(self):
+        def child_fn():
+            while True:
+                sleep(0.01)
+
+        def parent_fn():
+            child = ThreadTask(child_fn)
+            child.wait()
+
+        parent = ThreadTask(parent_fn)
+        time.sleep(0.05)
+        parent.stop()
+        with pytest.raises(Stopped):
+            parent.wait(timeout=1.0)
+        assert parent.is_stopped
+
+    def test_stop_inside_wait_propagates(self):
+        def slow():
+            sleep(10)
+
+        def outer():
+            inner = ThreadTask(slow)
+            inner.wait()
+
+        t = ThreadTask(outer)
+        time.sleep(0.05)
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+        assert t.is_stopped
+
+    def test_detach_prevents_stop_cascade(self):
+        child_ran = []
+
+        def child_fn():
+            time.sleep(0.1)
+            child_ran.append(True)
+
+        def parent_fn():
+            child = ThreadTask(child_fn)
+            child.detach()
+            sleep(10)
+
+        parent = ThreadTask(parent_fn)
+        time.sleep(0.02)
+        parent.stop()
+        with pytest.raises(Stopped):
+            parent.wait(timeout=1.0)
+        # child was detached — it should finish naturally
+        time.sleep(0.2)
+        assert child_ran == [True]
+
+    def test_del_stops_unwaited_task(self):
+        finished = threading.Event()
+
+        def fn():
+            finished.set()
+
+        exc_ref = [None]
+        t = ThreadTask(fn, on_finish=lambda r, e: exc_ref.__setitem__(0, e))
+        finished.wait(timeout=1.0)
+        del t
+        time.sleep(0.05)
+        assert exc_ref[0] is None  # finished normally; __del__ stop() was a no-op
+
+
+# ---------------------------------------------------------------------------
+# asynch factory
+# ---------------------------------------------------------------------------
+
+
+class TestAsynch:
+    def test_basic_usage(self):
+        task = asynch(lambda: 99)()
+        assert task.wait() == 99
+
+    def test_with_args(self):
+        task = asynch(lambda x, y: x + y)(3, 4)
+        assert task.wait() == 7
+
+    def test_with_name(self):
+        task = asynch(lambda: None, name="named")()
+        task.wait()
+        assert task._name == "named"
+
+    def test_with_on_finish(self):
+        done = []
+        asynch(lambda: 1, on_finish=lambda r, e: done.append(r))()
+        time.sleep(0.1)
+        assert done == [1]
+
+
+# ---------------------------------------------------------------------------
+# WorkerThread and WorkTask
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerThread:
+    def setup_method(self):
+        self.worker = WorkerThread(name="test-worker")
+
+    def teardown_method(self):
+        self.worker.stop()
+
+    def test_submit_returns_result(self):
+        wt = self.worker.submit(lambda: 42)
+        assert wt.wait() == 42
+
+    def test_submit_with_args(self):
+        wt = self.worker.submit(lambda x, y: x + y, (3, 4))
+        assert wt.wait() == 7
+
+    def test_submit_with_kwargs(self):
+        def add(x, y=0):
+            return x + y
+
+        wt = self.worker.submit(add, (10,), {"y": 5})
+        assert wt.wait() == 15
+
+    def test_jobs_run_serially(self):
+        order = []
+
+        def job(n):
+            order.append(n)
+            time.sleep(0.02)
+
+        tasks = [self.worker.submit(job, (i,)) for i in range(5)]
+        for t in tasks:
+            t.wait()
+        assert order == list(range(5))
+
+    def test_exception_propagates(self):
+        def boom():
+            raise RuntimeError("oops")
+
+        wt = self.worker.submit(boom)
+        with pytest.raises(RuntimeError, match="oops"):
+            wt.wait()
+
+    def test_is_done_after_completion(self):
+        wt = self.worker.submit(lambda: None)
+        wt.wait()
+        assert wt.is_done
+
+    def test_stopped_job_skipped(self):
+        ran = []
+        barrier = threading.Event()
+
+        def blocker():
+            barrier.wait(timeout=5)
+
+        def job():
+            ran.append(True)
+
+        slow = self.worker.submit(blocker)
+        wt = self.worker.submit(job)
+        wt.stop()
+        barrier.set()
+        slow.wait(timeout=1.0)
+        with pytest.raises(Stopped):
+            wt.wait(timeout=1.0)
+
+        assert ran == []
+        assert wt.is_stopped
+
+    def test_stop_propagates_to_child_task(self):
+        def job():
+            child = ThreadTask(lambda: sleep(10))
+            time.sleep(0.05)
+            return child
+
+        wt = self.worker.submit(job)
+        child = wt.wait(timeout=1.0)
+        wt.stop()
+        time.sleep(0.1)
+        assert wt.is_stopped
+        assert child.is_stopped
+
+
+# ---------------------------------------------------------------------------
+# Context propagation via throughline
+# ---------------------------------------------------------------------------
+
+
+class TestContextPropagation:
+    def test_thread_task_inherits_chain(self):
+        captured = []
+
+        def fn():
+            captured.append(task_chain())
+
+        with throughline(name="parent"):
+            t = ThreadTask(fn)
+            t.wait()
+
+        assert "parent" in captured[0]
+
+    def test_thread_task_extends_chain(self):
+        captured = []
+
+        def fn():
+            captured.append(task_chain())
+
+        with throughline(name="outer"):
+            t = ThreadTask(fn, name="inner")
+            t.wait()
+
+        assert captured[0] == ("outer", "inner")
+
+    def test_worker_task_restores_chain(self):
+        captured = []
+
+        def job():
+            captured.append(task_chain())
+
+        worker = WorkerThread(name="ctx-worker")
+        with throughline(name="caller"):
+            wt = worker.submit(job, name="job")
+            wt.wait()
+        worker.stop()
+
+        assert captured[0] == ("caller", "job")
+
+    def test_worker_task_snapshots_at_submit_not_execute(self):
+        # A job submitted after the frame exits does NOT inherit that frame.
+        captured = []
+
+        def job():
+            captured.append(task_chain())
+
+        worker = WorkerThread(name="snap-worker")
+        with throughline(name="request_handler"):
+            built = (job,)
+        wt = worker.submit(built[0], name="job")
+        wt.wait()
+        worker.stop()
+
+        assert captured[0] == ("job",)
+
+    def test_current_task_inside_thread_task(self):
+        captured = []
+
+        def fn():
+            captured.append(current_task())
+
+        t = ThreadTask(fn)
+        t.wait()
+        assert captured[0] is t
+
+    def test_current_task_inside_work_task(self):
+        captured = []
+
+        def job():
+            captured.append(current_task())
+
+        worker = WorkerThread()
+        wt = worker.submit(job)
+        wt.wait()
+        worker.stop()
+        assert captured[0] is wt
+
+    def test_current_task_none_outside_task(self):
+        assert current_task() is None
+
+
+# ---------------------------------------------------------------------------
+# ThroughlineNameFilter
+# ---------------------------------------------------------------------------
+
+
+class TestThroughlineNameFilter:
+    def test_injects_name_chain_into_record(self):
+        f = ThroughlineNameFilter()
+        record = logging.LogRecord("test", logging.INFO, "", 0, "msg", (), None)
+        with throughline(name="alpha"):
+            with throughline(name="beta"):
+                f.filter(record)
+        assert record.throughline == ("alpha", "beta")
+
+    def test_empty_chain_at_top_level(self):
+        f = ThroughlineNameFilter()
+        record = logging.LogRecord("test", logging.INFO, "", 0, "msg", (), None)
+        f.filter(record)
+        assert record.throughline == ()
+
+
+# ---------------------------------------------------------------------------
+# Stoppable primitives
+# ---------------------------------------------------------------------------
+
+
+class TestSleep:
+    def test_sleep_outside_task(self):
+        start = time.monotonic()
+        sleep(0.05)
+        assert time.monotonic() - start >= 0.04
+
+    def test_sleep_raises_stopped(self):
+        def fn():
+            sleep(10)
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait()
+
+    def test_sleep_zero_seconds(self):
+        def fn():
+            sleep(0)
+
+        t = ThreadTask(fn)
+        t.wait()
+
+
+class TestCheckStop:
+    def test_check_stop_outside_task(self):
+        check_stop()  # should not raise
+
+    def test_check_stop_raises_when_stopped(self):
+        barrier = threading.Event()
+
+        def fn():
+            barrier.set()
+            while True:
+                check_stop()
+                time.sleep(0.005)
+
+        t = ThreadTask(fn)
+        barrier.wait(timeout=1.0)
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait()
+
+
+class TestQueue:
+    def test_get_returns_item(self):
+        q = Queue()
+        q.put(1)
+        assert q.get() == 1
+
+    def test_get_raises_stopped_when_task_stopped(self):
+        q = Queue()
+
+        def fn():
+            q.get()
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait()
+
+    def test_get_timeout_raises_empty(self):
+        q = Queue()
+        with pytest.raises(_queue.Empty):
+            q.get(timeout=0.05)
+
+    def test_get_outside_task_blocks_normally(self):
+        q = Queue()
+        q.put("x")
+        assert q.get() == "x"
+
+
+class TestEvent:
+    def test_wait_returns_true_when_set(self):
+        e = Event()
+        e.set()
+        assert e.wait() is True
+
+    def test_wait_raises_stopped_when_task_stopped(self):
+        e = Event()
+
+        def fn():
+            e.wait()
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait()
+
+    def test_wait_timeout_returns_false(self):
+        e = Event()
+        assert e.wait(timeout=0.05) is False
+
+    def test_wait_outside_task(self):
+        e = Event()
+        e.set()
+        assert e.wait(timeout=1.0) is True
+
+
+class TestPoll:
+    def test_returns_truthy_value(self):
+        results = iter([None, None, 42])
+        assert poll(lambda: next(results), interval=0.01) == 42
+
+    def test_timeout_returns_last_value(self):
+        result = poll(lambda: False, interval=0.01, timeout=0.05)
+        assert result is False
+
+    def test_raises_stopped_when_task_stopped(self):
+        def fn():
+            poll(lambda: False, interval=0.01)
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait()

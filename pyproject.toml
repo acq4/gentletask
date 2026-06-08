@@ -1,0 +1,27 @@
+# Packaging and tooling config for the gentletask v7 reference implementation.
+# Scoped to v7/ so each spec version stays self-contained.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gentletask"
+version = "7.0.0"
+description = "Stoppable task hierarchies and semantic context (the throughline) for Python concurrency."
+readme = "spec.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "black"]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["gentletask.py"]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.pytest.ini_options]
+testpaths = ["test_gentletask.py"]
