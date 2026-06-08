@@ -27,8 +27,10 @@ from gentletask import (
     poll,
     sleep,
     task_chain,
+    task_context,
     throughline,
 )
+from gentletask import _task_stack
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +120,68 @@ class TestSemanticStack:
         with s(name="temp"):
             assert s.collect("name") == ("temp",)
         assert s.collect("name") == ()
+
+
+class TestRequiredKeys:
+    def test_missing_required_key_raises(self):
+        s = SemanticStack(required=("name",))
+        with pytest.raises(ValueError, match="required key"):
+            with s(other=1):
+                pass
+
+    def test_required_key_present_is_ok(self):
+        s = SemanticStack(required=("name",))
+        with s(name="ok"):
+            assert s.get("name") == "ok"
+
+    def test_extra_keys_allowed_alongside_required(self):
+        s = SemanticStack(required=("name",))
+        with s(name="ok", extra="also-fine"):
+            assert s.get("extra") == "also-fine"
+
+    def test_multiple_required_keys_all_listed_when_missing(self):
+        s = SemanticStack(required=("a", "b"))
+        with pytest.raises(ValueError, match="a, b"):
+            with s(c=1):
+                pass
+
+    def test_no_required_keys_allows_empty_frame(self):
+        s = SemanticStack()
+        with s():
+            assert s.frames() == ({},)
+
+
+class TestTwoStackDesign:
+    def test_throughline_requires_name(self):
+        with pytest.raises(ValueError, match="throughline"):
+            with throughline(note="no name here"):
+                pass
+
+    def test_task_stack_requires_task(self):
+        with pytest.raises(ValueError, match="_task_stack"):
+            with _task_stack(name="no task here"):
+                pass
+
+    def test_task_context_populates_both_stacks(self):
+        sentinel = object()
+        with task_context(sentinel, "the-name"):
+            assert current_task() is sentinel
+            assert throughline.collect("name") == ("the-name",)
+
+    def test_throughline_carries_no_task_during_task(self):
+        # The split means the task object lives only on _task_stack, never
+        # leaking into the name-only throughline.
+        seen = {}
+
+        def fn():
+            seen["throughline_frames"] = throughline.frames()
+            seen["task"] = current_task()
+
+        t = ThreadTask(fn, name="worker")
+        t.wait()
+        assert seen["task"] is t
+        assert all("task" not in f for f in seen["throughline_frames"])
+        assert seen["throughline_frames"][-1] == {"name": "worker"}
 
 
 class TestSemanticSnapshot:

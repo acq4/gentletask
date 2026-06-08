@@ -44,9 +44,17 @@ class SemanticStack:
 
     The stack has no opinion about tasks, threads, or logging; it just holds
     whatever keys callers provide.
+
+    A stack may declare *required* keys: every frame entered via ``__call__``
+    must supply them, or a ``ValueError`` is raised. Extra keys are always
+    allowed — ``required`` is a floor, not a schema.
     """
 
-    def __init__(self, name: str = "semantic_stack") -> None:
+    def __init__(
+        self, name: str = "semantic_stack", *, required: Iterable[str] = ()
+    ) -> None:
+        self._label = name
+        self._required: tuple[str, ...] = tuple(required)
         # A per-instance ContextVar so independent stacks stay isolated.
         self._var: contextvars.ContextVar[tuple[Frame, ...]] = contextvars.ContextVar(
             name, default=()
@@ -54,7 +62,15 @@ class SemanticStack:
 
     @contextlib.contextmanager
     def __call__(self, **kwargs: Any) -> Iterator[None]:
-        """Append a frame for the duration of the with block, then remove it."""
+        """Append a frame for the duration of the with block, then remove it.
+
+        Raises ValueError if any of this stack's required keys are missing.
+        """
+        missing = [key for key in self._required if key not in kwargs]
+        if missing:
+            raise ValueError(
+                f"{self._label} frame missing required key(s): " f"{', '.join(missing)}"
+            )
         frame: Frame = tuple(kwargs.items())
         token = self._var.set(self._var.get() + (frame,))
         try:
@@ -124,8 +140,14 @@ class SemanticSnapshot:
 # ---------------------------------------------------------------------------
 
 # A continuous thread of meaning running through all concurrent execution.
-# Task machinery, logging filters, and user code all share this one instance.
-throughline = SemanticStack("throughline")
+# Names only: this is the fun, human-readable narrative. Every frame must
+# carry a `name`. Logging filters and user code share this one instance.
+throughline = SemanticStack("throughline", required=("name",))
+
+# A private stack with a single purpose: tracking which Task is running. Every
+# frame carries exactly the running `task`. current_task() reads from here, so
+# the task machinery never has to mingle bookkeeping into the throughline.
+_task_stack = SemanticStack("_task_stack", required=("task",))
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +171,22 @@ class Task(Protocol):
     def detach(self) -> None: ...
 
 
+@contextlib.contextmanager
+def task_context(task: Task, name: str) -> Iterator[None]:
+    """Mark *task* as running for the duration of the block.
+
+    Enters one frame on each stack: *name* on the throughline (narrative) and
+    *task* on the private task stack (bookkeeping). Every Task implementation —
+    built-in or custom — should wrap its work in this so current_task() and the
+    log chain both line up.
+    """
+    with throughline(name=name), _task_stack(task=task):
+        yield
+
+
 def current_task() -> Task | None:
-    """Return the innermost Task on the throughline, or None outside any task."""
-    return throughline.get("task")
+    """Return the innermost running Task, or None outside any task."""
+    return _task_stack.get("task")
 
 
 def task_chain() -> tuple[str, ...]:
@@ -482,7 +517,8 @@ class ThreadTask(_TaskCore):
         # Register with the parent task (if any) so stop cascades.
         self._register_with_parent()
 
-        # Copy the calling context so the thread inherits the throughline stack.
+        # Copy the calling context so the thread inherits both stacks (the
+        # throughline narrative and the task chain) automatically.
         ctx = contextvars.copy_context()
         self._thread = threading.Thread(
             target=ctx.run,
@@ -503,7 +539,7 @@ class ThreadTask(_TaskCore):
     # -- internals -----------------------------------------------------------
 
     def _run(self) -> None:
-        with throughline(name=self._name, task=self):
+        with task_context(self, self._name):
             try:
                 if self.is_stopped:
                     raise Stopped()
@@ -565,12 +601,14 @@ class WorkTask(_TaskCore):
         super().__init__(fn, args, kwargs, name)
         # Snapshot the submitter's context at submit time. The job inherits the
         # context of the code that caused it to be submitted, not the worker's.
-        self._snapshot = throughline.snapshot()
+        # Both stacks travel: the narrative (throughline) and the task chain.
+        self._throughline_snapshot = throughline.snapshot()
+        self._task_snapshot = _task_stack.snapshot()
 
     def _execute(self) -> None:
         """Run the job body. Called by the worker thread."""
-        with self._snapshot.restore():
-            with throughline(name=self._name, task=self):
+        with self._throughline_snapshot.restore(), self._task_snapshot.restore():
+            with task_context(self, self._name):
                 result = None
                 exc: BaseException | None = None
                 try:
@@ -654,6 +692,7 @@ __all__ = [
     "WorkTask",
     "WorkerThread",
     "asynch",
+    "task_context",
     "current_task",
     "task_chain",
     "ThroughlineNameFilter",
