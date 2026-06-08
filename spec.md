@@ -39,6 +39,7 @@ mutating them has no effect on the stack.
 
 ```python
 class SemanticStack:
+    def __init__(self, name: str = "semantic_stack", *, required: Iterable[str] = ()): ...
     def __call__(self, **kwargs) -> ContextManager[None]: ...
     def get(self, key: str, default: Any = None) -> Any: ...
     def collect(self, key: str) -> tuple[Any, ...]: ...
@@ -56,8 +57,22 @@ Returns a context manager. On enter, appends a new frame. On exit, removes it.
 The `as` clause yields `None`. Nesting is supported and expected.
 
 ```python
-with throughline(name="calibrate", task=my_task):
+with throughline(name="calibrate"):
     do_work()
+```
+
+### Required keys
+
+A stack may be constructed with a list of `required` keys. Every frame entered
+via `__call__` must supply them, or a `ValueError` is raised. `required` is a
+floor, not a schema — extra keys are always allowed.
+
+```python
+labeled = SemanticStack(required=("name",))
+with labeled(name="calibrate", detail="x-axis"):  # ok — extra keys welcome
+    ...
+with labeled(detail="x-axis"):                     # ValueError: missing "name"
+    ...
 ```
 
 ### `get(key, default=None)`
@@ -98,28 +113,58 @@ tests, not by fiat.
 
 ---
 
-## Module-level singleton
+## Two stacks: `throughline` and the task stack
+
+The library keeps two `SemanticStack` singletons, each with a single, declared
+purpose:
 
 ```python
 from gentletask import throughline
+# throughline = SemanticStack("throughline", required=("name",))
+# _task_stack = SemanticStack("_task_stack", required=("task",))  # private
 ```
 
-All task machinery, logging filters, and user code share this one instance.
+- **`throughline`** is the public, human-readable narrative. It requires a
+  `name` on every frame and carries nothing else by convention — this is what
+  `task_chain()` and `ThroughlineNameFilter` read, and what shows up in logs.
+- **`_task_stack`** is private to the module. It requires a `task` on every
+  frame and exists only to track which `Task` is running; `current_task()`
+  reads from it. Keeping the task object off the throughline means the
+  narrative stays clean and name-only.
+
+Task code enters both at once via the `task_context` helper:
+
+```python
+from gentletask import task_context
+
+@contextmanager
+def task_context(task: Task, name: str) -> ContextManager[None]:
+    with throughline(name=name), _task_stack(task=task):
+        yield
+```
+
+Every `Task` implementation — built-in or custom — wraps its work in
+`task_context(self, name)` so `current_task()` and the log chain both line up.
+
 Independent `SemanticStack` instances can be constructed for isolated concerns,
-but task-related helpers like `current_task()` are tied to this singleton.
+but task-related helpers (`current_task()`, `task_context()`) are tied to these
+two singletons.
 
 ---
 
 ## Thread transfer
 
 `ThreadTask` uses `contextvars.copy_context()` at construction time — the new
-thread inherits the current throughline stack state automatically.
+thread inherits both stacks (the throughline narrative and the task chain)
+automatically.
 
-`WorkTask` calls `throughline.snapshot()` at `submit()` time. The snapshot
-captures the stack *as it exists when `submit()` is called* — this is
-intentional. A job inherits the context of the code that caused it to be
-submitted, not the context of the worker that happens to execute it. The worker
-thread is an implementation detail; it has no meaningful context of its own.
+`WorkTask` snapshots *both* stacks (`throughline.snapshot()` and the private
+task stack's snapshot) at `submit()` time, and restores both when the worker
+picks up the job. The snapshots capture state *as it exists when `submit()` is
+called* — this is intentional. A job inherits the context of the code that
+caused it to be submitted, not the context of the worker that happens to execute
+it. The worker thread is an implementation detail; it has no meaningful context
+of its own.
 
 ```python
 # job inherits "request_handler" — submit happens inside the frame
@@ -144,19 +189,23 @@ boundaries. `teleprox` makes use of this, as an example.
 
 ## `SemanticStack` outside of tasks
 
-```python
-from gentletask import throughline
+A `SemanticStack` with no required keys accepts any keys and interprets none of
+them — it is a general-purpose context-local stack. (The `throughline`
+singleton, by contrast, requires `name`; build your own stack for arbitrary
+keys.)
 
-with throughline(operation="abc123", user="alice"):
-    with throughline(operation="resize"):
-        throughline.collect("operation")  # ("abc123", "resize)
-        throughline.get("user")       # "alice"
-        throughline.frames()
+```python
+from gentletask import SemanticStack
+
+ctx = SemanticStack()
+with ctx(operation="abc123", user="alice"):
+    with ctx(operation="resize"):
+        ctx.collect("operation")  # ("abc123", "resize")
+        ctx.get("user")           # "alice"
+        ctx.frames()
         # ({"operation": "abc123", "user": "alice"},
         #  {"operation": "resize"})
 ```
-
-Any key names are valid. `SemanticStack` does not validate or interpret keys.
 
 ---
 
@@ -191,10 +240,11 @@ task = asynch(fn, name=None, detach=False, on_finish=None)(*args, **kwargs)
 ```
 
 **Context inheritance.** Uses `contextvars.copy_context()` so the thread starts
-with the caller's `SemanticStack` state. The task then pushes its own frame:
+with the caller's stack state (both stacks). The task then enters its own frame
+on each via `task_context`:
 
 ```python
-with throughline(name=self.name, task=self):
+with task_context(self, self.name):  # name -> throughline, self -> task stack
     fn(*args, **kwargs)
 ```
 
@@ -219,13 +269,14 @@ called automatically calls `stop()` on itself and its children.
 Returned by `WorkerThread.submit()`. Represents one job queued to a long-lived
 worker thread.
 
-**Context snapshot.** At submit time, captures `throughline.snapshot()`. When
-the worker picks up the job it calls `snapshot.restore()`, then pushes its own
-frame:
+**Context snapshot.** At submit time, snapshots both stacks. When the worker
+picks up the job it restores both snapshots, then enters its own frame on each
+via `task_context`:
 
 ```python
-with throughline(name=self.name, task=self):
-    fn(*args, **kwargs)
+with throughline_snapshot.restore(), task_snapshot.restore():
+    with task_context(self, self.name):
+        fn(*args, **kwargs)
 ```
 
 **`stop()`.** Sets `is_stopped`. If the job hasn't started, it is skipped. If
@@ -251,22 +302,22 @@ class WorkerThread:
 The worker loop:
 1. Pull the next `WorkTask` from the queue.
 2. If `task.is_stopped`, skip it (call callbacks with `Stopped` as the exception).
-3. Otherwise restore the task's captured context and execute `fn`.
+3. Otherwise restore the task's captured context (both stacks) and execute `fn`.
 4. Finish the task: set result or exception, fire callbacks, set `is_done`.
 
 ---
 
 ## Stop propagation
 
-`current_task()` returns the innermost `Task` on the `SemanticStack`, or `None`
-if called outside any task. The blocking primitives poll `current_task()` on
-each interval and raise `Stopped` if that task has been stopped. This means
+`current_task()` returns the innermost `Task` on the private task stack, or
+`None` if called outside any task. The blocking primitives poll `current_task()`
+on each interval and raise `Stopped` if that task has been stopped. This means
 stop propagation is fully cooperative: tasks are never interrupted mid-line,
 only at wait sites.
 
 ```python
 def current_task() -> Task | None:
-    return throughline.get("task")
+    return _task_stack.get("task")
 ```
 
 Calling these primitives outside any task is safe — they behave like their
@@ -311,12 +362,16 @@ ancestry in every log line.
 
 ## Custom tasks
 
-Implement the `Task` Protocol in any class. Push a frame at execution time:
+Implement the `Task` Protocol in any class. Wrap your work in `task_context` at
+execution time:
 
 ```python
-with throughline(name=self.name, task=self):
+with task_context(self, self.name):
     ...
 ```
 
-`task=self` makes `current_task()` work. `name=self.name` makes `task_chain()`
-and `TaskChainFilter` work. Both are optional — include only what you need.
+This enters `self` on the task stack (so `current_task()` works) and
+`self.name` on the throughline (so `task_chain()` and `ThroughlineNameFilter`
+work). Because both stacks declare required keys, `task_context` always supplies
+both — there is no "include only what you need" anymore; a task is named and
+tracked, or it isn't a task.
