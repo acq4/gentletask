@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import contextvars
 import logging
@@ -168,6 +169,8 @@ class Task(Protocol):
     def add_finish_callback(
         self, fn: Callable[[Any, BaseException | None], Any]
     ) -> None: ...
+    def add_stop_callback(self, fn: Callable[[], Any]) -> None: ...
+    def remove_stop_callback(self, fn: Callable[[], Any]) -> None: ...
     def detach(self) -> None: ...
 
 
@@ -209,6 +212,30 @@ class ThroughlineNameFilter(logging.Filter):
 _POLL_INTERVAL = 0.05
 
 
+@contextlib.contextmanager
+def _stop_waker(wake: Callable[[], None]) -> Iterator[None]:
+    """Call *wake* whenever the current task is stopped, for the block's duration.
+
+    This is the poll-free heart of stop propagation: instead of a waiter waking
+    periodically to ask "have I been stopped?", it parks indefinitely and lets
+    ``stop()`` push a *wake* notification through. *wake* fires immediately if
+    the task is already stopped, and once on each later ``stop()``.
+
+    Outside any task there is nothing to stop, so this is a no-op. *wake* must
+    not acquire a lock the caller already holds when entering this block — a
+    task that is already stopped fires *wake* synchronously from here.
+    """
+    task = current_task()
+    if task is None:
+        yield
+        return
+    task.add_stop_callback(wake)
+    try:
+        yield
+    finally:
+        task.remove_stop_callback(wake)
+
+
 def check_stop() -> None:
     """Raise Stopped if the current task has been stopped. Equivalent to sleep(0)."""
     task = current_task()
@@ -216,23 +243,25 @@ def check_stop() -> None:
         raise Stopped()
 
 
-def sleep(seconds: float, *, interval: float = _POLL_INTERVAL) -> None:
+def sleep(seconds: float) -> None:
     """Drop-in for time.sleep. Raises Stopped if the current task is stopped.
 
-    Safe to call outside any task — behaves like time.sleep.
+    Poll-free: blocks on the stop signal itself, so a stop unblocks the sleep
+    immediately rather than at the next polling tick. Safe to call outside any
+    task — behaves like time.sleep.
     """
     task = current_task()
     if task is None:
         time.sleep(seconds)
         return
-    deadline = time.monotonic() + seconds
-    while True:
+    woken = threading.Event()
+    with _stop_waker(woken.set):
         if task.is_stopped:
             raise Stopped()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        time.sleep(min(interval, remaining))
+        # woken.wait() returns True only if stop() set the event; a timeout
+        # (the full sleep elapsed without a stop) returns False.
+        if woken.wait(seconds):
+            raise Stopped()
 
 
 def poll(
@@ -241,108 +270,187 @@ def poll(
     interval: float = _POLL_INTERVAL,
     timeout: float | None = None,
 ) -> Any:
-    """Poll *fn* until it returns truthy, checking for stop each interval.
+    """Poll *fn* until it returns truthy, checking for stop between intervals.
 
+    *fn* is an arbitrary predicate, so it is necessarily sampled on *interval*;
+    stop, however, is poll-free — a stop unblocks the inter-poll wait at once.
     Returns the truthy value from *fn*, or the last falsy value on timeout.
     Raises Stopped if the current task is stopped while polling.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
-    while True:
-        check_stop()
-        result = fn()
-        if result:
-            return result
-        if deadline is not None and time.monotonic() >= deadline:
-            return result
-        time.sleep(interval)
+    woken = threading.Event()
+    with _stop_waker(woken.set):
+        while True:
+            check_stop()
+            result = fn()
+            if result:
+                return result
+            if deadline is not None and time.monotonic() >= deadline:
+                return result
+            wait_for = interval
+            if deadline is not None:
+                wait_for = min(interval, max(0.0, deadline - time.monotonic()))
+            if woken.wait(wait_for):
+                check_stop()  # stop arrived during the wait — raises Stopped
 
 
 class Queue:
-    """Drop-in for queue.Queue. get() raises Stopped if the current task is stopped."""
+    """Drop-in for queue.Queue. get() raises Stopped if the current task is stopped.
+
+    Backed by its own Condition rather than wrapping queue.Queue, so a stopped
+    task waiting in get() is woken immediately by the stop signal instead of
+    polling the underlying queue.
+    """
 
     def __init__(self, maxsize: int = 0) -> None:
-        self._q: _queue.Queue = _queue.Queue(maxsize)
+        self._maxsize = maxsize
+        self._items: collections.deque = collections.deque()
+        self._cond = threading.Condition()
+        self._unfinished = 0
 
     def get(self, block: bool = True, timeout: float | None = None) -> Any:
         task = current_task()
         if task is None or not block:
-            return self._q.get(block=block, timeout=timeout)
+            # No task to stop, or a non-blocking get: plain queue semantics.
+            with self._cond:
+                deadline = None if timeout is None else time.monotonic() + timeout
+                while not self._items:
+                    if not block:
+                        raise _queue.Empty()
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        raise _queue.Empty()
+                    self._cond.wait(remaining)
+                return self._items.popleft()
+
+        # Stop-aware path. Register the waker *before* taking self._cond so an
+        # already-stopped task fires wake() without re-entering our held lock.
+        def wake() -> None:
+            with self._cond:
+                self._cond.notify_all()
+
         deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            if task.is_stopped:
-                raise Stopped()
-            remaining = (
-                None if deadline is None else max(0.0, deadline - time.monotonic())
-            )
-            if remaining == 0.0:
-                raise _queue.Empty()
-            wait_for = (
-                _POLL_INTERVAL if remaining is None else min(_POLL_INTERVAL, remaining)
-            )
-            try:
-                return self._q.get(timeout=wait_for)
-            except _queue.Empty:
-                if remaining is not None and time.monotonic() >= deadline:
-                    raise
+        with _stop_waker(wake):
+            with self._cond:
+                while True:
+                    if task.is_stopped:
+                        raise Stopped()
+                    if self._items:
+                        return self._items.popleft()
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        raise _queue.Empty()
+                    self._cond.wait(remaining)
 
     def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
-        self._q.put(item, block=block, timeout=timeout)
+        with self._cond:
+            if self._maxsize > 0:
+                deadline = None if timeout is None else time.monotonic() + timeout
+                while len(self._items) >= self._maxsize:
+                    if not block:
+                        raise _queue.Full()
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        raise _queue.Full()
+                    self._cond.wait(remaining)
+            self._items.append(item)
+            self._unfinished += 1
+            self._cond.notify_all()
 
     def put_nowait(self, item: Any) -> None:
-        self._q.put_nowait(item)
+        self.put(item, block=False)
 
     def get_nowait(self) -> Any:
-        return self._q.get_nowait()
+        return self.get(block=False)
 
     def task_done(self) -> None:
-        self._q.task_done()
+        with self._cond:
+            if self._unfinished <= 0:
+                raise ValueError("task_done() called too many times")
+            self._unfinished -= 1
+            if self._unfinished == 0:
+                self._cond.notify_all()
 
     def join(self) -> None:
-        self._q.join()
+        with self._cond:
+            while self._unfinished > 0:
+                self._cond.wait()
 
     def qsize(self) -> int:
-        return self._q.qsize()
+        with self._cond:
+            return len(self._items)
 
     def empty(self) -> bool:
-        return self._q.empty()
+        with self._cond:
+            return not self._items
 
     def full(self) -> bool:
-        return self._q.full()
+        with self._cond:
+            return self._maxsize > 0 and len(self._items) >= self._maxsize
 
 
 class Event:
-    """Drop-in for threading.Event. wait() raises Stopped if the current task is stopped."""
+    """Drop-in for threading.Event. wait() raises Stopped if the current task is stopped.
+
+    Backed by its own Condition so a stopped task waiting in wait() is woken
+    immediately by the stop signal rather than polling the flag.
+    """
 
     def __init__(self) -> None:
-        self._event = threading.Event()
+        self._cond = threading.Condition()
+        self._flag = False
 
     def wait(self, timeout: float | None = None) -> bool:
         task = current_task()
         if task is None:
-            return self._event.wait(timeout=timeout)
+            with self._cond:
+                deadline = None if timeout is None else time.monotonic() + timeout
+                while not self._flag:
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        return self._flag
+                    self._cond.wait(remaining)
+                return True
+
+        # Stop-aware path. Register the waker before taking self._cond (see Queue).
+        def wake() -> None:
+            with self._cond:
+                self._cond.notify_all()
+
         deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            if task.is_stopped:
-                raise Stopped()
-            remaining = (
-                None if deadline is None else max(0.0, deadline - time.monotonic())
-            )
-            if remaining == 0.0:
-                return self._event.is_set()
-            wait_for = (
-                _POLL_INTERVAL if remaining is None else min(_POLL_INTERVAL, remaining)
-            )
-            if self._event.wait(wait_for):
+        with _stop_waker(wake):
+            with self._cond:
+                while not self._flag:
+                    if task.is_stopped:
+                        raise Stopped()
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        return self._flag
+                    self._cond.wait(remaining)
                 return True
 
     def set(self) -> None:
-        self._event.set()
+        with self._cond:
+            self._flag = True
+            self._cond.notify_all()
 
     def clear(self) -> None:
-        self._event.clear()
+        with self._cond:
+            self._flag = False
 
     def is_set(self) -> bool:
-        return self._event.is_set()
+        with self._cond:
+            return self._flag
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +482,14 @@ class _TaskCore:
         self._done = threading.Event()
         self._stop_requested = threading.Event()
         self._lock = threading.RLock()
+        # A Condition over the same lock lets wait() park indefinitely and be
+        # woken poll-free, either by _finish() (this task is done) or by a stop
+        # nudge registered on the parent (the parent was stopped).
+        self._cond = threading.Condition(self._lock)
         self._children: weakref.WeakSet[Task] = weakref.WeakSet()
         self._callbacks: list[Callable[[Any, BaseException | None], Any]] = []
+        # Zero-arg callbacks fired exactly once when stop() is first requested.
+        self._stop_callbacks: list[Callable[[], Any]] = []
         self._result: Any = None
         self._exception: BaseException | None = None
         self._detach = False
@@ -401,29 +515,49 @@ class _TaskCore:
         """Block until done, re-raising any worker exception.
 
         If called from inside another task, a stop request on that parent
-        propagates to this task on each poll interval.
+        propagates to this task: the parent wakes this wait the moment it is
+        stopped (poll-free), and we then stop ourselves and raise Stopped.
         """
         parent = current_task()
         if parent is not None and parent is not self and not self._detach:
             if hasattr(parent, "_children"):
                 parent._children.add(self)
 
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            remaining = (
-                None if deadline is None else max(0.0, deadline - time.monotonic())
-            )
-            wait_for = (
-                _POLL_INTERVAL if remaining is None else min(_POLL_INTERVAL, remaining)
-            )
-            if self._done.wait(wait_for):
-                break
-            if parent is not None and parent is not self and parent.is_stopped:
-                self.stop()
-                raise Stopped()
-            if remaining == 0.0:
-                break  # timed out
+        # Wake this wait when the parent stops, so the cascade is immediate.
+        def _nudge() -> None:
+            with self._cond:
+                self._cond.notify_all()
 
+        watch_parent = (
+            parent is not None
+            and parent is not self
+            and hasattr(parent, "add_stop_callback")
+        )
+        stopped_by_parent = False
+        if watch_parent:
+            parent.add_stop_callback(_nudge)
+        try:
+            deadline = None if timeout is None else time.monotonic() + timeout
+            with self._cond:
+                while True:
+                    if self._done.is_set():
+                        break
+                    if parent is not None and parent is not self and parent.is_stopped:
+                        stopped_by_parent = True
+                        break
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        break  # timed out
+                    self._cond.wait(remaining)
+        finally:
+            if watch_parent:
+                parent.remove_stop_callback(_nudge)
+
+        if stopped_by_parent:
+            self.stop()
+            raise Stopped()
         if not self.is_done:
             return None
         if self._exception is not None:
@@ -431,10 +565,25 @@ class _TaskCore:
         return self._result
 
     def stop(self) -> None:
-        """Request cooperative stop; cascades to all registered children."""
-        self._stop_requested.set()
+        """Request cooperative stop; fire stop callbacks; cascade to children.
+
+        Idempotent: the stop callbacks fire exactly once, on the first stop.
+        """
         with self._lock:
+            already = self._stop_requested.is_set()
+            self._stop_requested.set()
             children = list(self._children)
+            callbacks, self._stop_callbacks = list(self._stop_callbacks), []
+        if already:
+            return
+        # Fire callbacks and cascade outside the lock: a stop callback typically
+        # acquires another object's lock to wake a waiter, and a child's stop()
+        # takes the child's lock — holding ours here would invite deadlock.
+        for cb in callbacks:
+            try:
+                cb()
+            except Exception:
+                pass
         for child in children:
             child.stop()
 
@@ -453,6 +602,26 @@ class _TaskCore:
                 return
         fn(result, exc)
 
+    def add_stop_callback(self, fn: Callable[[], Any]) -> None:
+        """Call fn() when this task is stopped.
+
+        Fires fn immediately in the current thread if already stopped. This is
+        the hook the blocking primitives use to wake without polling.
+        """
+        with self._lock:
+            if not self._stop_requested.is_set():
+                self._stop_callbacks.append(fn)
+                return
+        fn()
+
+    def remove_stop_callback(self, fn: Callable[[], Any]) -> None:
+        """Remove a previously registered stop callback; a no-op if absent."""
+        with self._lock:
+            try:
+                self._stop_callbacks.remove(fn)
+            except ValueError:
+                pass
+
     def detach(self) -> None:
         """Remove this task from its parent's stop propagation."""
         self._detach = True
@@ -470,7 +639,16 @@ class _TaskCore:
     def _finish(self, result: Any = None, exc: BaseException | None = None) -> None:
         self._result = result
         self._exception = exc
-        self._done.set()
+        self._mark_done()
+
+    def _mark_done(self) -> None:
+        """Mark the task done, wake any waiters poll-free, then run callbacks.
+
+        ``self._result`` / ``self._exception`` must already be set.
+        """
+        with self._cond:
+            self._done.set()
+            self._cond.notify_all()
         self._run_callbacks()
 
     def _run_callbacks(self) -> None:
@@ -548,8 +726,7 @@ class ThreadTask(_TaskCore):
                 self._exception = exc
             finally:
                 self._stop_running_children()
-                self._done.set()
-                self._run_callbacks()
+                self._mark_done()
 
     def __del__(self) -> None:
         if not self._waited and not self.is_done:

@@ -238,6 +238,140 @@ class TestTaskProtocol:
         worker.stop()
         assert isinstance(wt, Task)
 
+    def test_protocol_requires_stop_callbacks(self):
+        # A class missing the stop-callback hooks is not a Task: poll-free stop
+        # propagation depends on every task being able to wake its waiters.
+        class WithoutHooks:
+            is_done = True
+            is_stopped = False
+            result = None
+
+            def wait(self, timeout=None):
+                return None
+
+            def stop(self):
+                pass
+
+            def add_finish_callback(self, fn):
+                pass
+
+            def detach(self):
+                pass
+
+        assert not isinstance(WithoutHooks(), Task)
+
+
+# ---------------------------------------------------------------------------
+# Stop callback registry — the poll-free propagation mechanism
+# ---------------------------------------------------------------------------
+
+
+class TestStopCallbacks:
+    def test_callback_fires_on_stop(self):
+        fired = []
+        t = ThreadTask(lambda: sleep(10))
+        t.add_stop_callback(lambda: fired.append(True))
+        time.sleep(0.05)
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+        assert fired == [True]
+
+    def test_callback_fires_immediately_if_already_stopped(self):
+        fired = []
+        t = ThreadTask(lambda: sleep(10))
+        time.sleep(0.05)
+        t.stop()
+        t.add_stop_callback(lambda: fired.append(True))
+        assert fired == [True]
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+
+    def test_callback_fires_once_for_repeated_stop(self):
+        fired = []
+        t = ThreadTask(lambda: sleep(10))
+        t.add_stop_callback(lambda: fired.append(True))
+        time.sleep(0.05)
+        t.stop()
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+        assert fired == [True]
+
+    def test_remove_stop_callback(self):
+        fired = []
+        cb = lambda: fired.append(True)
+        t = ThreadTask(lambda: sleep(10))
+        t.add_stop_callback(cb)
+        t.remove_stop_callback(cb)
+        time.sleep(0.05)
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+        assert fired == []
+
+    def test_work_task_stop_callback_fires(self):
+        worker = WorkerThread()
+        fired = []
+        wt = worker.submit(lambda: sleep(10))
+        wt.add_stop_callback(lambda: fired.append(True))
+        time.sleep(0.05)
+        wt.stop()
+        with pytest.raises(Stopped):
+            wt.wait(timeout=1.0)
+        worker.stop()
+        assert fired == [True]
+
+
+# ---------------------------------------------------------------------------
+# Poll-free wake — long waits with no polling interval still unblock on stop
+# ---------------------------------------------------------------------------
+
+
+class TestPollFreeWake:
+    def test_sleep_wakes_on_stop_without_interval(self):
+        # A poll-free sleep blocks on the stop signal itself, so even a very
+        # long sleep unblocks promptly on stop — latency is not tied to any
+        # polling interval.
+        def fn():
+            sleep(30)
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        start = time.monotonic()
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+        assert time.monotonic() - start < 0.5
+
+    def test_event_wait_wakes_on_stop_with_no_timeout(self):
+        e = Event()
+
+        def fn():
+            e.wait()  # timeout=None — blocks indefinitely until set or stopped
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        start = time.monotonic()
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+        assert time.monotonic() - start < 0.5
+
+    def test_queue_get_wakes_on_stop_with_no_timeout(self):
+        q = Queue()
+
+        def fn():
+            q.get()  # timeout=None — blocks indefinitely until item or stopped
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        start = time.monotonic()
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+        assert time.monotonic() - start < 0.5
+
 
 # ---------------------------------------------------------------------------
 # ThreadTask — basic behavior

@@ -224,8 +224,18 @@ class Task(Protocol):
     def wait(self, timeout: float | None = None) -> Any: ...
     def stop(self) -> None: ...
     def add_finish_callback(self, fn: Callable[[Any, BaseException | None], None]) -> None: ...
+    def add_stop_callback(self, fn: Callable[[], None]) -> None: ...
+    def remove_stop_callback(self, fn: Callable[[], None]) -> None: ...
     def detach(self) -> None: ...
 ```
+
+`add_stop_callback(fn)` registers a zero-argument callback fired exactly once
+when the task is first stopped; if the task is already stopped, `fn` runs
+immediately. `remove_stop_callback(fn)` unregisters it. These hooks are how stop
+propagation reaches blocking primitives without polling — a waiter registers a
+callback that wakes it, then unregisters on exit (see *Stop propagation*). Every
+`Task` must implement them so any task — built-in or custom — can be waited on
+poll-free.
 
 ---
 
@@ -255,9 +265,11 @@ stops any still-running children unless they were explicitly detached.
 **`detach()`.** Removes this task from its parent's stop propagation. A
 subsequent `parent.stop()` will not cascade here.
 
-**`wait(timeout=None, interval=0.05)`.** Polls in 50 ms intervals. If called
-from inside another task, checks whether that parent is stopped on each
-interval; if so, calls `self.stop()` and raises `Stopped`.
+**`wait(timeout=None)`.** Blocks until the task is done, parked on a per-task
+`Condition` rather than a poll loop — `_finish()` notifies it directly. If
+called from inside another task, `wait` registers a stop callback on that parent
+so a `parent.stop()` wakes the wait immediately; it then calls `self.stop()` and
+raises `Stopped`.
 
 **`__del__` cleanup.** A `ThreadTask` garbage-collected before `wait()` is
 called automatically calls `stop()` on itself and its children.
@@ -316,7 +328,8 @@ it is running, stop propagates to child tasks via the normal mechanism.  The
 worker thread itself is not interrupted — it is long-lived and not owned by any
 single task.
 
-**`wait(timeout=None)`.** Same poll-and-check-stop semantics as `ThreadTask`.
+**`wait(timeout=None)`.** Same poll-free wake-on-done / wake-on-parent-stop
+semantics as `ThreadTask`.
 
 ---
 
@@ -342,18 +355,31 @@ The worker loop:
 ## Stop propagation
 
 `current_task()` returns the innermost `Task` on the private task stack, or
-`None` if called outside any task. The blocking primitives poll `current_task()`
-on each interval and raise `Stopped` if that task has been stopped. This means
-stop propagation is fully cooperative: tasks are never interrupted mid-line,
-only at wait sites.
+`None` if called outside any task.
 
 ```python
 def current_task() -> Task | None:
     return _task_stack.get("task")
 ```
 
-Calling these primitives outside any task is safe — they behave like their
-stdlib equivalents.
+Stop propagation is **poll-free**: it is pushed, not polled. `stop()` sets the
+stop flag and then fires every callback registered via `add_stop_callback`
+(exactly once, on the first stop) before cascading to children. Each blocking
+primitive, before it parks, registers a callback that wakes it — for `sleep` the
+callback sets a private `threading.Event` it is waiting on; for `Queue`, `Event`,
+and `wait` it notifies the `Condition` the primitive is parked on. So a stopped
+task is woken the instant `stop()` runs, with latency independent of any polling
+interval, and a fully idle wait consumes no CPU.
+
+A small shared helper, `_stop_waker(wake)`, encapsulates the register-and-wake
+pattern: it registers `wake` on the current task (firing it immediately if the
+task is already stopped) and unregisters on exit. Callbacks fire *outside* the
+task's lock so a waker may freely take the lock of the object it is waking
+without risking deadlock.
+
+Stop remains fully cooperative: tasks are never interrupted mid-line, only at
+wait sites. Calling these primitives outside any task is safe — with no current
+task there is nothing to stop, so they behave like their stdlib equivalents.
 
 ---
 
@@ -362,20 +388,24 @@ stdlib equivalents.
 **`Stopped`.** Exception raised when a task's stop has been requested. Unwind
 normally; finally blocks run.
 
-**`sleep(seconds, *, interval=0.05)`.** Drop-in for `time.sleep`. Polls in
-`interval`-second chunks, raising `Stopped` if the current task is stopped.
+**`sleep(seconds)`.** Drop-in for `time.sleep`. Blocks on the stop signal
+itself, so a stop unblocks it immediately (raising `Stopped`); otherwise it
+returns once `seconds` have elapsed. No polling interval — the wait is exact.
 
-**`check_stop()`.** Equivalent to `sleep(0)`. Use in tight loops where a sleep
-interval would be inappropriate.
+**`check_stop()`.** Equivalent to `sleep(0)`. Use in tight loops to surrender at
+a known-safe point.
 
-**`Queue`.** Drop-in for `queue.Queue`. `get(timeout=None)` raises `Stopped`
-while waiting if the current task is stopped.
+**`Queue`.** Drop-in for `queue.Queue`, backed by its own `Condition` rather
+than wrapping `queue.Queue`. `get(timeout=None)` raises `Stopped` while waiting
+if the current task is stopped, woken at once by the stop signal.
 
-**`Event`.** Drop-in for `threading.Event`. `wait(timeout=None)` raises
-`Stopped` while waiting if the current task is stopped.
+**`Event`.** Drop-in for `threading.Event`, backed by its own `Condition`.
+`wait(timeout=None)` raises `Stopped` while waiting if the current task is
+stopped, woken at once by the stop signal.
 
-**`poll(fn, *, interval, timeout)`.** Polls `fn` in a loop with periodic
-`check_stop()` calls.
+**`poll(fn, *, interval, timeout)`.** Samples `fn` on `interval` (an arbitrary
+predicate cannot be event-driven), but the inter-sample wait is poll-free with
+respect to stop: a stop unblocks it immediately and raises `Stopped`.
 
 ---
 
@@ -407,3 +437,8 @@ This enters `self` on the task stack (so `current_task()` works) and
 work). Because both stacks declare required keys, `task_context` always supplies
 both — there is no "include only what you need" anymore; a task is named and
 tracked, or it isn't a task.
+
+A custom task must also implement `add_stop_callback` / `remove_stop_callback`
+so the blocking primitives can wake on its stop without polling. The simplest
+route is to reuse the built-in machinery by deriving from the same shared core
+(or by keeping a list of stop callbacks and firing them, once, from `stop()`).
