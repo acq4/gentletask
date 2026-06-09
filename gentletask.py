@@ -930,6 +930,93 @@ class WorkTask(_TaskCore):
 
 
 # ---------------------------------------------------------------------------
+# Promise
+# ---------------------------------------------------------------------------
+
+
+class Promise(_TaskCore):
+    """A Task with no thread or body, completed externally. Implements the Task protocol.
+
+    Where ThreadTask and WorkTask are *body-driven* — a callable runs and its
+    return value (or exception) finishes the task — a Promise is *externally
+    completed*. It has no body and spawns no thread; some already-existing
+    producer finishes it by calling ``resolve()`` or ``fail()``. The intended
+    producers are things that are going to fire anyway: a hardware monitor
+    thread that notices a target reached, a socket-reply reader, a GUI callback,
+    a lock loop. Wrapping those in a ThreadTask would mean a useless parking
+    thread per result; a Promise is just the shared completion state.
+
+    A Promise otherwise participates fully in the Task protocol and the stop
+    hierarchy: it registers with the task that created it, so a parent stop
+    cascades to it; ``wait()`` blocks poll-free until completion and returns the
+    resolved value, re-raises a failed exception, or raises ``Stopped`` for a
+    stopped promise; finish and stop callbacks behave exactly as on the other
+    tasks.
+    """
+
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        on_finish: Callable[[Any, BaseException | None], Any] | None = None,
+    ) -> None:
+        # A Promise has no body — fn is unused. Pass a sensible default name so
+        # the _TaskCore name fallback never has to stringify a None callable.
+        super().__init__(
+            fn=None, args=(), kwargs={}, name=name or "Promise", on_finish=on_finish
+        )
+        # Register immediately so the creating task's stop cascades here.
+        self._register_with_parent()
+
+    def resolve(self, value: Any = None) -> None:
+        """Complete the promise successfully with *value*.
+
+        Idempotent: a no-op if the promise is already resolved, failed, or
+        stopped. Otherwise wakes any waiters poll-free and fires finish
+        callbacks with ``(value, None)``.
+        """
+        with self._lock:
+            if self._done.is_set():
+                return
+        self._finish(result=value)
+
+    def fail(self, exc: BaseException) -> None:
+        """Complete the promise with an exception.
+
+        Idempotent: a no-op if the promise is already done. Otherwise wakes any
+        waiters poll-free; ``wait()`` will re-raise *exc* and finish callbacks
+        fire with ``(None, exc)``.
+        """
+        with self._lock:
+            if self._done.is_set():
+                return
+        self._finish(exc=exc)
+
+    def stop(self) -> None:
+        """Request stop, then complete the promise with ``Stopped``.
+
+        A stopped promise has no body to raise ``Stopped``, so it must complete
+        itself or its waiters would hang forever. ``super().stop()`` runs first:
+        it sets the stop flag, fires stop callbacks (so an external producer can
+        abort its side-effects), and cascades to children. A stop callback may
+        legitimately resolve or fail the promise, so we only inject ``Stopped``
+        if the promise is still incomplete afterwards. Idempotent via
+        ``super().stop()``'s own guard.
+        """
+        super().stop()
+        with self._lock:
+            if self._done.is_set():
+                return
+        self._finish(exc=Stopped())
+
+    def __repr__(self) -> str:
+        status = (
+            "done" if self.is_done else ("stopped" if self.is_stopped else "pending")
+        )
+        return f"<Promise {self._name!r} {status}>"
+
+
+# ---------------------------------------------------------------------------
 # WorkerThread
 # ---------------------------------------------------------------------------
 
@@ -1014,6 +1101,7 @@ __all__ = [
     "Task",
     "ThreadTask",
     "WorkTask",
+    "Promise",
     "WorkerThread",
     "asynch",
     "synch",

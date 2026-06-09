@@ -365,6 +365,47 @@ semantics as `ThreadTask`.
 
 ---
 
+## `Promise`
+
+A `Task` with **no thread and no body**, completed *externally*. `ThreadTask`
+and `WorkTask` are body-driven — a callable runs and its return value (or
+exception) finishes the task. A `Promise` instead represents a result that some
+already-existing producer will finish: a hardware monitor thread, a socket-reply
+reader, a GUI callback, a lock loop. Wrapping those in a `ThreadTask` would mean
+a useless parking thread per result; a `Promise` is just the shared completion
+state. It otherwise participates fully in the Task protocol and the stop
+hierarchy.
+
+```python
+class Promise(_TaskCore):
+    def __init__(self, name: str | None = None, *, on_finish=None): ...
+    def resolve(self, value: Any = None) -> None: ...   # complete successfully
+    def fail(self, exc: BaseException) -> None: ...      # complete with exception
+    def stop(self) -> None: ...                          # complete with Stopped
+```
+
+**Construction.** Registers with the creating task (`_register_with_parent`) so
+a parent `stop()` cascades here. Spawns **no thread**. `fn` is unused, so the
+name falls back to `"Promise"`.
+
+**`resolve(value)` / `fail(exc)`.** Complete the promise via `_finish`, waking
+waiters poll-free and firing finish callbacks with `(value, None)` or
+`(None, exc)`. Both are **idempotent**: the first completion (resolve, fail, or
+stop) wins; later calls are no-ops.
+
+**`stop()`.** A stopped promise has no body to raise `Stopped`, so it must
+complete itself or its waiters hang. `stop()` first calls `super().stop()` —
+setting `is_stopped`, firing stop callbacks (so the external producer can abort
+its side-effects), and cascading to children — then, if the promise is still
+incomplete (a stop callback may have already resolved/failed it), completes it
+with `Stopped`. Idempotent.
+
+**`wait(timeout=None)`.** Inherited: returns the resolved value, re-raises a
+failed exception, or raises `Stopped` for a stopped promise, with the same
+poll-free wake-on-done / wake-on-parent-stop semantics as `ThreadTask`.
+
+---
+
 ## `WorkerThread`
 
 A long-lived thread that serialises jobs.

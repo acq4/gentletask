@@ -14,6 +14,7 @@ import pytest
 
 from gentletask import (
     Event,
+    Promise,
     Queue,
     SemanticSnapshot,
     SemanticStack,
@@ -1554,3 +1555,171 @@ class TestCallbackErrorsLogged:
             with pytest.raises(Stopped):
                 t.wait(timeout=1.0)
         assert "stop callback raised" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Promise — externally-completed Task with no thread/body
+# ---------------------------------------------------------------------------
+
+
+class TestPromise:
+    def test_is_task(self):
+        assert isinstance(Promise(), Task)
+
+    def test_resolve_makes_wait_return_value(self):
+        p = Promise()
+        p.resolve(42)
+        assert p.wait() == 42
+        assert p.result == 42
+        assert p.is_done
+
+    def test_resolve_spawns_no_thread(self):
+        before = threading.active_count()
+        p = Promise(name="no-thread")
+        p.resolve(1)
+        p.wait()
+        # No parking thread was ever created for the promise.
+        assert threading.active_count() == before
+        assert not any(t.name == "no-thread" for t in threading.enumerate())
+
+    def test_resolve_default_value_is_none(self):
+        p = Promise()
+        p.resolve()
+        assert p.wait() is None
+
+    def test_fail_reraises_through_wait(self):
+        p = Promise()
+        boom = ValueError("boom")
+        p.fail(boom)
+        with pytest.raises(ValueError, match="boom"):
+            p.wait()
+        assert p.is_done
+
+    def test_stop_before_completion_raises_stopped(self):
+        p = Promise()
+        fired = []
+        p.add_stop_callback(lambda: fired.append(True))
+        p.stop()
+        assert p.is_stopped
+        assert p.is_done
+        assert fired == [True]
+        with pytest.raises(Stopped):
+            p.wait()
+        # A late resolve is a no-op: it stays Stopped.
+        p.resolve(99)
+        with pytest.raises(Stopped):
+            p.wait()
+
+    def test_resolve_is_idempotent(self):
+        p = Promise()
+        p.resolve(1)
+        p.resolve(2)  # ignored
+        assert p.wait() == 1
+
+    def test_resolve_after_fail_ignored(self):
+        p = Promise()
+        p.fail(RuntimeError("nope"))
+        p.resolve(7)  # ignored
+        with pytest.raises(RuntimeError, match="nope"):
+            p.wait()
+
+    def test_fail_after_resolve_ignored(self):
+        p = Promise()
+        p.resolve(3)
+        p.fail(RuntimeError("nope"))  # ignored
+        assert p.wait() == 3
+
+    def test_on_finish_fires_with_value_on_resolve(self):
+        seen = []
+        p = Promise(on_finish=lambda v, e: seen.append((v, e)))
+        p.resolve(5)
+        assert seen == [(5, None)]
+
+    def test_add_finish_callback_fires_on_fail(self):
+        seen = []
+        p = Promise()
+        exc = ValueError("x")
+        p.add_finish_callback(lambda v, e: seen.append((v, e)))
+        p.fail(exc)
+        assert seen == [(None, exc)]
+
+    def test_add_finish_callback_fires_immediately_if_done(self):
+        p = Promise()
+        p.resolve(11)
+        seen = []
+        p.add_finish_callback(lambda v, e: seen.append((v, e)))
+        assert seen == [(11, None)]
+
+    def test_parent_stop_cascades_to_promise(self):
+        # A Promise created inside a running ThreadTask is stopped when the
+        # parent stops, and the parent's wait() on it unblocks with Stopped.
+        captured = {}
+
+        def parent_fn():
+            p = Promise(name="child-promise")
+            captured["promise"] = p
+            p.wait()  # never resolved; only the parent stop frees it
+
+        parent = ThreadTask(parent_fn)
+        # Wait for the promise to be created inside the parent.
+        deadline = time.monotonic() + 1.0
+        while "promise" not in captured and time.monotonic() < deadline:
+            time.sleep(0.005)
+        parent.stop()
+        with pytest.raises(Stopped):
+            parent.wait(timeout=1.0)
+        assert captured["promise"].is_stopped
+        assert captured["promise"].is_done
+
+    def test_consumer_in_sibling_task_gets_value(self):
+        p = Promise(name="shared")
+
+        def consumer():
+            return p.wait()
+
+        sibling = ThreadTask(consumer)
+        time.sleep(0.05)  # sibling is now parked in p.wait()
+        p.resolve("hello")
+        assert sibling.wait(timeout=1.0) == "hello"
+
+    def test_consumer_resolved_before_sibling_stop_keeps_value(self):
+        # If the producer resolves the promise before a consuming sibling is
+        # stopped, the value stands — stopping the now-finished sibling cannot
+        # retroactively corrupt the already-completed promise.
+        p = Promise(name="shared2")
+
+        def consumer():
+            return p.wait()
+
+        sibling = ThreadTask(consumer)
+        time.sleep(0.05)
+        p.resolve("locked-in")
+        assert sibling.wait(timeout=1.0) == "locked-in"
+        sibling.stop()  # late stop on a finished task cascades to the promise
+        # The already-resolved value stands; stop cannot overwrite a finished
+        # promise's result (Promise.stop only injects Stopped if not yet done).
+        assert p.wait() == "locked-in"
+
+    def test_stopping_consuming_sibling_cascades_to_promise(self):
+        # A promise waited on from inside a task joins that task's stop cascade
+        # (the inherited Task wait() contract): stopping the consumer stops the
+        # promise too, cleanly, with no hung waiter. This is propagation, not
+        # corruption — the promise ends up consistently stopped+done.
+        p = Promise(name="shared3")
+
+        def consumer():
+            p.wait()
+
+        sibling = ThreadTask(consumer)
+        time.sleep(0.05)
+        sibling.stop()
+        with pytest.raises(Stopped):
+            sibling.wait(timeout=1.0)
+        assert p.is_stopped
+        assert p.is_done
+        with pytest.raises(Stopped):
+            p.wait(timeout=1.0)
+
+    def test_default_name(self):
+        p = Promise()
+        assert "Promise" in repr(p) or p._name == "Promise"

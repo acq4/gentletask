@@ -45,9 +45,10 @@ dependencies**.
 
 A **Task** is anything that satisfies the `Task` protocol — a unit of work that
 can report whether it is `is_done` / `is_stopped`, be `wait()`-ed on, and be
-asked to `stop()`. The two built-in implementations are `ThreadTask` (runs a
-callable in its own daemon thread) and `WorkTask` (one job queued to a
-long-lived `WorkerThread`).
+asked to `stop()`. The built-in implementations are `ThreadTask` (runs a
+callable in its own daemon thread), `WorkTask` (one job queued to a long-lived
+`WorkerThread`), and `Promise` (no thread or body — completed externally by an
+already-existing producer).
 
 Tasks form a hierarchy automatically: when a task is created or waited on from
 *inside* another running task, it registers as a **child** of that task. Calling
@@ -382,6 +383,39 @@ worker.stop()          # already-queued jobs drain, then the thread shuts down
 After `stop()`, the worker drains any jobs already queued and then exits;
 further `submit()` calls raise `RuntimeError`.
 
+### `Promise` — an externally-completed task
+
+`ThreadTask` and `WorkTask` are *body-driven*: a callable runs and its return
+value (or exception) finishes the task. But many real results are *externally
+completed* — finished by a producer that already exists (a hardware monitor
+thread, a socket-reply reader, a GUI callback, a lock loop) rather than by a
+body of their own. Wrapping those in a `ThreadTask` would burn a useless parking
+thread per result. A `Promise` is the missing primitive: a `Task` with **no
+thread and no body**, completed externally via `resolve()` / `fail()`, that
+otherwise participates fully in the Task protocol and the stop hierarchy.
+
+```python
+from gentletask import Promise, ThreadTask
+
+# A producer hands out a Promise and finishes it later from wherever it runs.
+target_reached = Promise(name="target-reached")
+
+def monitor():  # some already-running producer
+    ...                            # watch the hardware
+    target_reached.resolve(123)    # complete it from outside — no new thread
+
+ThreadTask(monitor, name="hw-monitor")
+print(target_reached.wait())       # blocks poll-free until resolve() -> 123
+```
+
+`resolve(value)` completes it successfully; `fail(exc)` completes it with an
+exception that `wait()` re-raises. Both are idempotent — the first completion
+wins and later calls are no-ops. A `Promise` created inside a running task
+registers as that task's child, so a parent `stop()` cascades to it; because a
+stopped promise has no body to raise `Stopped`, `stop()` fires its stop
+callbacks (letting the external producer abort its side-effects) and then
+completes the promise with `Stopped` so its waiters never hang.
+
 ### Logging integration
 
 `ThroughlineNameFilter` injects `throughline.collect("name")` onto every log
@@ -548,6 +582,7 @@ to use the stop-aware primitives.
 | `Task` | `runtime_checkable` structural `Protocol` for a stoppable, waitable unit of work. |
 | `ThreadTask(fn, args=(), kwargs=None, *, name=None, detach=False, on_finish=None, start=True)` | Runs `fn` in a new daemon thread; implements `Task`. With `start=False`, call `.start()` to launch (idempotent). |
 | `WorkTask(fn, args, kwargs, name=None)` | One job queued to a `WorkerThread`; implements `Task`. Usually created via `WorkerThread.submit`. |
+| `Promise(name=None, *, on_finish=None)` | A `Task` with no thread or body, completed externally via `resolve(value)` / `fail(exc)`; implements `Task`. Idempotent completion; `stop()` completes it with `Stopped`. |
 | `WorkerThread(name=None)` | Long-lived worker thread that serializes submitted jobs. `submit(...)` returns a `WorkTask`; `stop()` drains queued jobs and shuts down. |
 | `asynch(fn, name=None, detach=False, on_finish=None)` | Returns a launcher that starts `fn` in a new `ThreadTask` when called. |
 | `synch(fn)` | Returns a synchronous version of `fn` that de-wraps `asynch` and awaits returned tasks, yielding a concrete value. |
