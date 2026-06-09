@@ -875,7 +875,13 @@ class WorkerThread:
     def __init__(self, name: str | None = None) -> None:
         self._name = name or "WorkerThread"
         self._queue: _queue.Queue = _queue.Queue()
-        self._stopping = threading.Event()
+        self._stopping = False
+        # Serialises submit() against stop() so the stop check and the enqueue
+        # are atomic with respect to each other. Without it, submit() could
+        # pass the stop check, stop() could then set the flag and enqueue the
+        # sentinel, and submit() would enqueue its task *behind* the sentinel —
+        # where it never runs and its wait() hangs forever.
+        self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True, name=self._name)
         self._thread.start()
 
@@ -893,20 +899,24 @@ class WorkerThread:
         after stop() would sit behind the shutdown sentinel and never run,
         leaving its wait() to block forever.
         """
-        if self._stopping.is_set():
-            raise RuntimeError(f"{self._name} is stopped; cannot submit new jobs")
-        task = WorkTask(fn, args, kwargs or {}, name=name)
-        self._queue.put(task)
+        with self._lock:
+            if self._stopping:
+                raise RuntimeError(f"{self._name} is stopped; cannot submit new jobs")
+            task = WorkTask(fn, args, kwargs or {}, name=name)
+            self._queue.put(task)
         return task
 
     def stop(self) -> None:
         """Drain already-queued jobs, then shut the thread down.
 
         Jobs enqueued before this call still run (the sentinel is FIFO behind
-        them); further submit() calls are rejected.
+        them); further submit() calls are rejected. Idempotent.
         """
-        self._stopping.set()
-        self._queue.put(_WORKER_STOP)
+        with self._lock:
+            if self._stopping:
+                return
+            self._stopping = True
+            self._queue.put(_WORKER_STOP)
 
     # -- internals -----------------------------------------------------------
 

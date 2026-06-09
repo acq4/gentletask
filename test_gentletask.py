@@ -1245,6 +1245,45 @@ class TestWorkerThreadShutdown:
             t.wait(timeout=1.0)
         assert results == list(range(5))
 
+    def test_stop_is_idempotent(self):
+        worker = WorkerThread()
+        wt = worker.submit(lambda: 1)
+        wt.wait(timeout=1.0)
+        worker.stop()
+        worker.stop()  # second call is a no-op, not a second sentinel
+        with pytest.raises(RuntimeError, match="stopped"):
+            worker.submit(lambda: None)
+
+    def test_concurrent_submit_and_stop_never_strands_a_task(self):
+        # Regression guard for the submit()/stop() race. A task returned by a
+        # successful submit() must have been enqueued before the shutdown
+        # sentinel, so it always runs; without the mutex it could land behind
+        # the sentinel and hang. We hammer the two calls concurrently and
+        # assert every accepted task completes.
+        for _ in range(30):
+            worker = WorkerThread(name="race-worker")
+            accepted = []
+            list_lock = threading.Lock()
+
+            def submitter():
+                while True:
+                    try:
+                        t = worker.submit(lambda: "ran")
+                    except RuntimeError:
+                        return  # worker stopped — stop submitting
+                    with list_lock:
+                        accepted.append(t)
+
+            threads = [threading.Thread(target=submitter) for _ in range(4)]
+            for th in threads:
+                th.start()
+            worker.stop()
+            for th in threads:
+                th.join(timeout=2.0)
+            for t in accepted:
+                assert t.wait(timeout=2.0) == "ran"
+                assert t.is_done
+
 
 # ---------------------------------------------------------------------------
 # Custom Task implementations interoperate with the stop-aware primitives
