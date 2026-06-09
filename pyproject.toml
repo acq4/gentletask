@@ -1,4 +1,4 @@
-# Packaging and tooling config for gentletask
+# Packaging and tooling config for gentletask.
 
 [build-system]
 requires = ["hatchling"]
@@ -6,14 +6,39 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gentletask"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Stoppable task hierarchies and semantic context (the throughline) for Python concurrency."
-readme = "spec.md"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Martin Chase" },
+    { name = "Luke Campagnola" },
+]
+keywords = ["concurrency", "threading", "tasks", "cancellation", "contextvars"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest", "black"]
+
+[project.urls]
+Homepage = "https://github.com/acq4/gentletask"
+Repository = "https://github.com/acq4/gentletask"
+
+[tool.hatch.version]
+path = "gentletask.py"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["gentletask.py"]
