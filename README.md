@@ -61,6 +61,13 @@ the stop-aware blocking primitives (`sleep`, `check_stop`, `Queue.get`,
 `Event.wait`, `poll`, and `Task.wait`) notice the stop at their wait site and
 raise `Stopped`, which unwinds normally so your `finally` blocks run.
 
+`stop()` takes an optional `reason` string for diagnostics. The first stop on a
+task records its reason (a later stop is a no-op and does not overwrite it),
+which then travels into the `Stopped` exception raised at the wait site — so
+`str(exc)` is the reason — and cascades along with the stop into children. A
+plain `stop()` with no reason behaves exactly as before, yielding a reason-less
+`Stopped()`. Read the recorded reason back via the `stop_reason` property.
+
 Stop propagation is **poll-free**: `stop()` *pushes* a notification rather than
 relying on a polling loop. Before a primitive parks, it registers a zero-arg
 callback via `add_stop_callback`; `stop()` fires those callbacks (exactly once,
@@ -414,7 +421,8 @@ wins and later calls are no-ops. A `Promise` created inside a running task
 registers as that task's child, so a parent `stop()` cascades to it; because a
 stopped promise has no body to raise `Stopped`, `stop()` fires its stop
 callbacks (letting the external producer abort its side-effects) and then
-completes the promise with `Stopped` so its waiters never hang.
+completes the promise with `Stopped` so its waiters never hang. `stop(reason)`
+carries the reason into that injected `Stopped`.
 
 ### Logging integration
 
@@ -573,7 +581,7 @@ to use the stop-aware primitives.
 
 | Name | Description |
 | --- | --- |
-| `Stopped` | Raised inside a task when `stop()` has been requested. Unwinds normally; `finally` blocks run. |
+| `Stopped` | Raised inside a task when `stop()` has been requested. Carries the optional `reason` passed to `stop()` as its message (`str(Stopped("foo")) == "foo"`; a reason-less `Stopped()` is empty). Unwinds normally; `finally` blocks run. |
 
 ### Tasks
 
@@ -582,7 +590,7 @@ to use the stop-aware primitives.
 | `Task` | `runtime_checkable` structural `Protocol` for a stoppable, waitable unit of work. |
 | `ThreadTask(fn, args=(), kwargs=None, *, name=None, detach=False, on_finish=None, start=True)` | Runs `fn` in a new daemon thread; implements `Task`. With `start=False`, call `.start()` to launch (idempotent). |
 | `WorkTask(fn, args, kwargs, name=None)` | One job queued to a `WorkerThread`; implements `Task`. Usually created via `WorkerThread.submit`. |
-| `Promise(name=None, *, on_finish=None)` | A `Task` with no thread or body, completed externally via `resolve(value)` / `fail(exc)`; implements `Task`. Idempotent completion; `stop()` completes it with `Stopped`. |
+| `Promise(name=None, *, on_finish=None)` | A `Task` with no thread or body, completed externally via `resolve(value)` / `fail(exc)`; implements `Task`. Idempotent completion; `stop(reason=None)` completes it with `Stopped` carrying the reason. |
 | `WorkerThread(name=None)` | Long-lived worker thread that serializes submitted jobs. `submit(...)` returns a `WorkTask`; `stop()` drains queued jobs and shuts down. |
 | `asynch(fn, name=None, detach=False, on_finish=None)` | Returns a launcher that starts `fn` in a new `ThreadTask` when called. |
 | `synch(fn)` | Returns a synchronous version of `fn` that de-wraps `asynch` and awaits returned tasks, yielding a concrete value. |
@@ -593,9 +601,10 @@ to use the stop-aware primitives.
 | --- | --- |
 | `is_done: bool` | Whether the task has finished. |
 | `is_stopped: bool` | Whether a stop has been requested. |
+| `stop_reason` | Property; the `reason` passed to the first `stop()`, or `None` for a reason-less stop. |
 | `result` | Property; shorthand for `wait()`. |
-| `wait(timeout=None)` | Block until done, re-raising any worker exception. A stop on the calling parent propagates here and raises `Stopped`. |
-| `stop()` | Request cooperative stop; fire stop callbacks once; cascade to children. |
+| `wait(timeout=None)` | Block until done, re-raising any worker exception. A stop on the calling parent propagates here and raises `Stopped` carrying the parent's reason. |
+| `stop(reason=None)` | Request cooperative stop; record `reason` (first stop only); fire stop callbacks once; cascade to children (passing the reason along). |
 | `add_finish_callback(fn)` | Call `fn(result, exception)` when the task finishes (immediately if already finished). |
 | `add_stop_callback(fn)` | Call zero-arg `fn()` once when the task is stopped (immediately if already stopped). |
 | `remove_stop_callback(fn)` | Unregister a stop callback; no-op if absent. |
@@ -629,6 +638,9 @@ to use the stop-aware primitives.
 | `poll(fn, *, interval=0.05, timeout=None)` | Sample `fn` until truthy; stop-aware inter-sample wait. Returns `fn`'s truthy value, or the last falsy value on timeout. |
 | `Queue(maxsize=0)` | Drop-in for `queue.Queue`; `get()` raises `Stopped` if the current task is stopped. |
 | `Event()` | Drop-in for `threading.Event`; `wait()` raises `Stopped` if the current task is stopped. |
+
+Every `Stopped` these raise carries the stopped task's `stop_reason` as its
+message, so callers can log *why* the task unwound.
 
 ---
 

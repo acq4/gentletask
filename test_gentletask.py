@@ -1723,3 +1723,142 @@ class TestPromise:
     def test_default_name(self):
         p = Promise()
         assert "Promise" in repr(p) or p._name == "Promise"
+
+
+# ---------------------------------------------------------------------------
+# Stop reasons
+# ---------------------------------------------------------------------------
+
+
+class TestStopReason:
+    def test_sleep_stopped_carries_reason(self):
+        captured = []
+
+        def fn():
+            try:
+                sleep(30)
+            except Stopped as exc:
+                captured.append(str(exc))
+                raise
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        t.stop(reason="user cancelled")
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "user cancelled"
+        assert captured == ["user cancelled"]
+
+    def test_check_stop_carries_reason(self):
+        barrier = threading.Event()
+
+        def fn():
+            barrier.set()
+            while True:
+                check_stop()
+                time.sleep(0.005)
+
+        t = ThreadTask(fn)
+        barrier.wait(timeout=1.0)
+        t.stop(reason="check-stop reason")
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "check-stop reason"
+
+    def test_poll_carries_reason(self):
+        barrier = threading.Event()
+
+        def fn():
+            barrier.set()
+            poll(lambda: False)
+
+        t = ThreadTask(fn)
+        barrier.wait(timeout=1.0)
+        t.stop(reason="poll reason")
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "poll reason"
+
+    def test_queue_get_carries_reason(self):
+        q = Queue()
+
+        def fn():
+            q.get()
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        t.stop(reason="queue reason")
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "queue reason"
+
+    def test_event_wait_carries_reason(self):
+        e = Event()
+
+        def fn():
+            e.wait()
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        t.stop(reason="event reason")
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "event reason"
+
+    def test_promise_stop_reason_reaches_waiter(self):
+        p = Promise(name="promised")
+        p.stop(reason="why")
+        with pytest.raises(Stopped) as info:
+            p.wait(timeout=1.0)
+        assert str(info.value) == "why"
+
+    def test_parent_stop_reason_cascades_to_child(self):
+        def child_fn():
+            sleep(30)
+
+        def parent_fn():
+            child = ThreadTask(child_fn)
+            child.wait()
+
+        parent = ThreadTask(parent_fn)
+        time.sleep(0.05)
+        parent.stop(reason="parent says stop")
+        with pytest.raises(Stopped) as info:
+            parent.wait(timeout=1.0)
+        assert str(info.value) == "parent says stop"
+
+    def test_idempotent_stop_keeps_first_reason(self):
+        t = ThreadTask(lambda: sleep(30))
+        time.sleep(0.05)
+        t.stop(reason="first")
+        t.stop(reason="second")
+        assert t.stop_reason == "first"
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "first"
+
+    def test_stop_without_reason_is_reasonless(self):
+        t = ThreadTask(lambda: sleep(30))
+        time.sleep(0.05)
+        t.stop()
+        assert t.stop_reason is None
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == ""
+
+    def test_stop_reason_accessor_returns_stored_reason(self):
+        t = ThreadTask(lambda: sleep(30))
+        time.sleep(0.05)
+        t.stop(reason="diagnostic")
+        assert t.stop_reason == "diagnostic"
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+
+    def test_stop_before_run_carries_reason(self):
+        barrier = threading.Event()
+        t = ThreadTask(lambda: barrier.wait(1.0), start=False)
+        t.stop(reason="never started")
+        t.start()
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "never started"

@@ -294,14 +294,22 @@ with task_context(self, self.name):  # name -> throughline, self -> task stack
 all registered children. When a task finishes — normally or by exception — it
 stops any still-running children unless they were explicitly detached.
 
+**`stop(reason=None)`.** Requests a cooperative stop. The optional `reason` is a
+diagnostic string recorded by the *first* stop only (a later `stop()` is a no-op
+and does not overwrite it), exposed via the `stop_reason` property. The reason
+cascades to children (`child.stop(reason)`) and is carried into the `Stopped`
+that the stop-aware primitives raise, so logs can record why work was stopped. A
+reason-less `stop()` yields a message-less `Stopped()`, exactly as before.
+
 **`detach()`.** Removes this task from its parent's stop propagation. A
 subsequent `parent.stop()` will not cascade here.
 
 **`wait(timeout=None)`.** Blocks until the task is done, parked on a per-task
 `Condition` rather than a poll loop — `_finish()` notifies it directly. If
 called from inside another task, `wait` registers a stop callback on that parent
-so a `parent.stop()` wakes the wait immediately; it then calls `self.stop()` and
-raises `Stopped`.
+so a `parent.stop()` wakes the wait immediately; it then calls
+`self.stop(parent.stop_reason)` and raises `Stopped` carrying the parent's
+reason.
 
 **`__del__` cleanup.** A `ThreadTask` garbage-collected before `wait()` is
 called automatically calls `stop()` on itself and its children.
@@ -381,7 +389,7 @@ class Promise(_TaskCore):
     def __init__(self, name: str | None = None, *, on_finish=None): ...
     def resolve(self, value: Any = None) -> None: ...   # complete successfully
     def fail(self, exc: BaseException) -> None: ...      # complete with exception
-    def stop(self) -> None: ...                          # complete with Stopped
+    def stop(self, reason: str | None = None) -> None: ...  # complete with Stopped
 ```
 
 **Construction.** Registers with the creating task (`_register_with_parent`) so
@@ -393,12 +401,13 @@ waiters poll-free and firing finish callbacks with `(value, None)` or
 `(None, exc)`. Both are **idempotent**: the first completion (resolve, fail, or
 stop) wins; later calls are no-ops.
 
-**`stop()`.** A stopped promise has no body to raise `Stopped`, so it must
-complete itself or its waiters hang. `stop()` first calls `super().stop()` —
-setting `is_stopped`, firing stop callbacks (so the external producer can abort
-its side-effects), and cascading to children — then, if the promise is still
-incomplete (a stop callback may have already resolved/failed it), completes it
-with `Stopped`. Idempotent.
+**`stop(reason=None)`.** A stopped promise has no body to raise `Stopped`, so it
+must complete itself or its waiters hang. `stop()` first calls
+`super().stop(reason)` — recording the reason, setting `is_stopped`, firing stop
+callbacks (so the external producer can abort its side-effects), and cascading to
+children — then, if the promise is still incomplete (a stop callback may have
+already resolved/failed it), completes it with `Stopped` carrying that reason.
+Idempotent.
 
 **`wait(timeout=None)`.** Inherited: returns the resolved value, re-raises a
 failed exception, or raises `Stopped` for a stopped promise, with the same
@@ -458,8 +467,12 @@ task there is nothing to stop, so they behave like their stdlib equivalents.
 
 ## Supporting primitives
 
-**`Stopped`.** Exception raised when a task's stop has been requested. Unwind
-normally; finally blocks run.
+**`Stopped`.** Exception raised when a task's stop has been requested. Carries
+the optional `reason` passed to `stop()` as its message, so `str(Stopped("foo"))
+== "foo"` and a reason-less `Stopped()` is empty. Every site that raises it for a
+stopped current task — `check_stop`, `sleep`, `Queue.get`, `Event.wait`, `poll`
+(via `check_stop`), and `Task.wait`'s parent-cascade — supplies that task's
+`stop_reason`. Unwind normally; finally blocks run.
 
 **`sleep(seconds)`.** Drop-in for `time.sleep`. Blocks on the stop signal
 itself, so a stop unblocks it immediately (raising `Stopped`); otherwise it

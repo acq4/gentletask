@@ -27,8 +27,29 @@ _logger = logging.getLogger(__name__)
 class Stopped(Exception):
     """Raised inside a task when stop() has been requested.
 
+    Carries the optional *reason* passed to ``stop()`` as its message, so
+    ``str(Stopped("foo")) == "foo"`` and a reason-less ``Stopped()`` is empty.
     Unwinds normally; finally blocks run.
     """
+
+
+def _stopped(reason: str | None) -> Stopped:
+    """Build a ``Stopped`` carrying *reason* as its message, or empty if None.
+
+    A reason-less stop must produce a message-less ``Stopped`` (``str(...) ==
+    ""``) exactly as before, so a None reason is dropped rather than stringified
+    to the literal ``"None"``.
+    """
+    return Stopped(reason) if reason is not None else Stopped()
+
+
+def _task_stop_reason(task: "Task | None") -> str | None:
+    """Read *task*'s stop reason, tolerating Task implementations without one.
+
+    The built-in tasks record ``_stop_reason``; a hand-rolled Task that merely
+    satisfies the protocol need not, so a missing attribute reads as None.
+    """
+    return getattr(task, "_stop_reason", None)
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +225,7 @@ class Task(Protocol):
     def result(self) -> Any: ...
 
     def wait(self, timeout: float | None = None) -> Any: ...
-    def stop(self) -> None: ...
+    def stop(self, reason: str | None = None) -> None: ...
     def add_finish_callback(
         self, fn: Callable[[Any, BaseException | None], Any]
     ) -> None: ...
@@ -302,7 +323,7 @@ def check_stop() -> None:
     """Raise Stopped if the current task has been stopped. Equivalent to sleep(0)."""
     task = current_task()
     if task is not None and task.is_stopped:
-        raise Stopped()
+        raise _stopped(_task_stop_reason(task))
 
 
 def sleep(seconds: float) -> None:
@@ -319,11 +340,11 @@ def sleep(seconds: float) -> None:
     woken = threading.Event()
     with _stop_waker(woken.set):
         if task.is_stopped:
-            raise Stopped()
+            raise _stopped(_task_stop_reason(task))
         # woken.wait() returns True only if stop() set the event; a timeout
         # (the full sleep elapsed without a stop) returns False.
         if woken.wait(seconds):
-            raise Stopped()
+            raise _stopped(_task_stop_reason(task))
 
 
 def poll(
@@ -394,7 +415,7 @@ class Queue:
             with self._cond:
                 while True:
                     if task.is_stopped:
-                        raise Stopped()
+                        raise _stopped(_task_stop_reason(task))
                     if self._items:
                         item = self._items.popleft()
                         self._cond.notify_all()  # wake a putter waiting for space
@@ -480,7 +501,7 @@ class Event:
             with self._cond:
                 while not self._flag:
                     if task.is_stopped:
-                        raise Stopped()
+                        raise _stopped(_task_stop_reason(task))
                     remaining = _remaining(deadline)
                     if remaining is not None and remaining <= 0:
                         return self._flag
@@ -529,6 +550,10 @@ class _TaskCore:
 
         self._done = threading.Event()
         self._stop_requested = threading.Event()
+        # The reason recorded by the first stop(), or None for a reason-less
+        # stop. Read via the stop_reason property; threaded into the Stopped
+        # raised at each stop-aware site so logs can say WHY work was stopped.
+        self._stop_reason: str | None = None
         self._lock = threading.RLock()
         # A Condition over the same lock lets wait() park indefinitely and be
         # woken poll-free, either by _finish() (this task is done) or by a stop
@@ -554,6 +579,11 @@ class _TaskCore:
     @property
     def is_stopped(self) -> bool:
         return self._stop_requested.is_set()
+
+    @property
+    def stop_reason(self) -> str | None:
+        """The reason passed to the first stop(), or None for a reason-less stop."""
+        return self._stop_reason
 
     @property
     def result(self) -> Any:
@@ -602,22 +632,26 @@ class _TaskCore:
                 parent.remove_stop_callback(_nudge)
 
         if stopped_by_parent:
-            self.stop()
-            raise Stopped()
+            self.stop(_task_stop_reason(parent))
+            raise _stopped(_task_stop_reason(parent))
         if not self.is_done:
             return None
         if self._exception is not None:
             raise self._exception
         return self._result
 
-    def stop(self) -> None:
+    def stop(self, reason: str | None = None) -> None:
         """Request cooperative stop; fire stop callbacks; cascade to children.
 
-        Idempotent: the stop callbacks fire exactly once, on the first stop.
+        Idempotent: the stop callbacks fire exactly once, on the first stop, and
+        only that first stop records *reason*. A later stop() is a no-op and does
+        not overwrite the reason. The reason cascades to children so a parent
+        stop explains itself all the way down.
         """
         with self._lock:
             if self._stop_requested.is_set():
                 return  # already stopped; callbacks fired on the first stop
+            self._stop_reason = reason
             self._stop_requested.set()
             children = list(self._children)
             callbacks, self._stop_callbacks = list(self._stop_callbacks), []
@@ -630,7 +664,7 @@ class _TaskCore:
             except Exception:
                 _logger.exception("stop callback raised")
         for child in children:
-            child.stop()
+            child.stop(reason)
 
     def add_finish_callback(
         self, fn: Callable[[Any, BaseException | None], Any]
@@ -812,7 +846,7 @@ class ThreadTask(_TaskCore):
             exc: BaseException | None = None
             try:
                 if self.is_stopped:
-                    raise Stopped()
+                    raise _stopped(self._stop_reason)
                 result = self._fn(*self._args, **self._kwargs)
             except BaseException as e:
                 exc = e
@@ -992,22 +1026,23 @@ class Promise(_TaskCore):
                 return
         self._finish(exc=exc)
 
-    def stop(self) -> None:
+    def stop(self, reason: str | None = None) -> None:
         """Request stop, then complete the promise with ``Stopped``.
 
         A stopped promise has no body to raise ``Stopped``, so it must complete
         itself or its waiters would hang forever. ``super().stop()`` runs first:
-        it sets the stop flag, fires stop callbacks (so an external producer can
-        abort its side-effects), and cascades to children. A stop callback may
-        legitimately resolve or fail the promise, so we only inject ``Stopped``
-        if the promise is still incomplete afterwards. Idempotent via
-        ``super().stop()``'s own guard.
+        it sets the stop flag (recording *reason*), fires stop callbacks (so an
+        external producer can abort its side-effects), and cascades to children.
+        A stop callback may legitimately resolve or fail the promise, so we only
+        inject ``Stopped`` if the promise is still incomplete afterwards. The
+        injected ``Stopped`` carries the recorded reason so a stopped promise's
+        waiters learn WHY. Idempotent via ``super().stop()``'s own guard.
         """
-        super().stop()
+        super().stop(reason)
         with self._lock:
             if self._done.is_set():
                 return
-        self._finish(exc=Stopped())
+        self._finish(exc=_stopped(self._stop_reason))
 
     def __repr__(self) -> str:
         status = (
@@ -1083,7 +1118,7 @@ class WorkerThread:
             task: WorkTask = item
             if task.is_stopped:
                 # Skip a job that was stopped before it ever ran.
-                task._finish(exc=Stopped())
+                task._finish(exc=_stopped(task._stop_reason))
                 continue
 
             task._execute()
