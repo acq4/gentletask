@@ -934,3 +934,398 @@ class TestPoll:
         t.stop()
         with pytest.raises(Stopped):
             t.wait()
+
+
+class TestPollEdges:
+    def test_immediate_success_does_not_wait(self):
+        calls = []
+
+        def fn():
+            calls.append(1)
+            return "ready"
+
+        assert poll(fn, interval=10.0) == "ready"
+        assert calls == [1]  # truthy on the first sample; never parked
+
+    def test_fn_exception_propagates(self):
+        def fn():
+            raise RuntimeError("poll boom")
+
+        with pytest.raises(RuntimeError, match="poll boom"):
+            poll(fn, interval=0.01, timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Queue — bounded mode, join, and non-blocking accessors
+# ---------------------------------------------------------------------------
+
+
+class TestQueueBounded:
+    def test_put_nowait_raises_full(self):
+        q = Queue(maxsize=1)
+        q.put(1)
+        with pytest.raises(_queue.Full):
+            q.put_nowait(2)
+
+    def test_put_blocks_until_space(self):
+        q = Queue(maxsize=1)
+        q.put(1)
+        order = []
+
+        def producer():
+            order.append("before")
+            q.put(2)  # blocks until the consumer makes room
+            order.append("after")
+
+        t = threading.Thread(target=producer, daemon=True)
+        t.start()
+        time.sleep(0.05)
+        assert order == ["before"]  # still parked in put()
+        assert q.get() == 1  # frees a slot
+        t.join(timeout=1.0)
+        assert order == ["before", "after"]
+        assert q.get() == 2
+
+    def test_put_timeout_raises_full(self):
+        q = Queue(maxsize=1)
+        q.put(1)
+        with pytest.raises(_queue.Full):
+            q.put(2, timeout=0.05)
+
+    def test_full_reports_capacity(self):
+        q = Queue(maxsize=2)
+        assert not q.full()
+        q.put(1)
+        q.put(2)
+        assert q.full()
+
+    def test_unbounded_is_never_full(self):
+        q = Queue()
+        for i in range(100):
+            q.put(i)
+        assert not q.full()
+
+
+class TestQueueJoin:
+    def test_task_done_too_many_raises(self):
+        q = Queue()
+        with pytest.raises(ValueError, match="too many"):
+            q.task_done()
+
+    def test_join_unblocks_when_all_tasks_done(self):
+        q = Queue()
+        q.put("a")
+        q.put("b")
+        order = []
+
+        def waiter():
+            q.join()
+            order.append("joined")
+
+        t = threading.Thread(target=waiter, daemon=True)
+        t.start()
+        q.get()
+        q.task_done()
+        time.sleep(0.02)
+        assert order == []  # one unfinished item remains
+        q.get()
+        q.task_done()
+        t.join(timeout=1.0)
+        assert order == ["joined"]
+
+    def test_join_returns_immediately_when_idle(self):
+        q = Queue()
+        q.join()  # nothing outstanding
+
+
+class TestQueueNonBlocking:
+    def test_get_nowait_raises_empty(self):
+        q = Queue()
+        with pytest.raises(_queue.Empty):
+            q.get_nowait()
+
+    def test_get_nowait_returns_item(self):
+        q = Queue()
+        q.put(5)
+        assert q.get_nowait() == 5
+
+    def test_qsize_and_empty(self):
+        q = Queue()
+        assert q.empty()
+        assert q.qsize() == 0
+        q.put(1)
+        assert not q.empty()
+        assert q.qsize() == 1
+
+
+# ---------------------------------------------------------------------------
+# Event — flag state
+# ---------------------------------------------------------------------------
+
+
+class TestEventState:
+    def test_is_set_reflects_flag(self):
+        e = Event()
+        assert e.is_set() is False
+        e.set()
+        assert e.is_set() is True
+
+    def test_clear_then_wait_blocks_again(self):
+        e = Event()
+        e.set()
+        assert e.wait(timeout=0.05) is True
+        e.clear()
+        assert e.is_set() is False
+        assert e.wait(timeout=0.05) is False
+
+
+# ---------------------------------------------------------------------------
+# Already-stopped tasks raise at the wait site without parking
+# ---------------------------------------------------------------------------
+
+
+class TestAlreadyStopped:
+    def test_sleep_zero_raises_when_stopped(self):
+        # check_stop's "equivalent to sleep(0)" claim: sleep(0) must surrender.
+        def fn():
+            current_task().stop()
+            sleep(0)
+
+        t = ThreadTask(fn)
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+
+    def test_queue_get_raises_immediately_when_already_stopped(self):
+        q = Queue()
+
+        def fn():
+            current_task().stop()
+            q.get()  # must raise without deadlocking on the empty queue
+
+        t = ThreadTask(fn)
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+
+    def test_event_wait_raises_immediately_when_already_stopped(self):
+        e = Event()
+
+        def fn():
+            current_task().stop()
+            e.wait()  # must raise without parking on the unset event
+
+        t = ThreadTask(fn)
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# wait() timeout, repeated result access, and post-exception callbacks
+# ---------------------------------------------------------------------------
+
+
+class TestWaitSemantics:
+    def test_wait_timeout_then_completes(self):
+        release = threading.Event()
+
+        def fn():
+            release.wait(5)
+            return 99
+
+        t = ThreadTask(fn)
+        assert t.wait(timeout=0.05) is None  # not done yet
+        release.set()
+        assert t.wait(timeout=1.0) == 99  # re-waited to completion
+
+    def test_result_reraises_on_each_access(self):
+        def boom():
+            raise ValueError("kaboom")
+
+        t = ThreadTask(boom)
+        with pytest.raises(ValueError, match="kaboom"):
+            t.wait()
+        with pytest.raises(ValueError, match="kaboom"):
+            t.wait()  # the stored exception is re-raised, not cleared
+
+    def test_add_finish_callback_after_done_delivers_exception(self):
+        def boom():
+            raise ValueError("late")
+
+        t = ThreadTask(boom)
+        with pytest.raises(ValueError):
+            t.wait()
+        seen = []
+        t.add_finish_callback(lambda r, e: seen.append((r, e)))
+        assert seen[0][0] is None
+        assert isinstance(seen[0][1], ValueError)
+
+
+# ---------------------------------------------------------------------------
+# Multi-level stop cascade
+# ---------------------------------------------------------------------------
+
+
+class TestMultiLevelCascade:
+    def test_stop_cascades_through_grandchild(self):
+        captured = {}
+
+        def grandchild_fn():
+            while True:
+                sleep(0.01)
+
+        def child_fn():
+            gc = ThreadTask(grandchild_fn, name="grandchild")
+            captured["gc"] = gc
+            gc.wait()
+
+        def parent_fn():
+            c = ThreadTask(child_fn, name="child")
+            captured["c"] = c
+            c.wait()
+
+        parent = ThreadTask(parent_fn, name="parent")
+        time.sleep(0.1)
+        parent.stop()
+        with pytest.raises(Stopped):
+            parent.wait(timeout=1.0)
+        time.sleep(0.1)
+        assert captured["c"].is_stopped
+        assert captured["gc"].is_stopped
+
+
+# ---------------------------------------------------------------------------
+# WorkerThread shutdown semantics
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerThreadShutdown:
+    def test_submit_after_stop_raises(self):
+        worker = WorkerThread()
+        worker.stop()
+        with pytest.raises(RuntimeError, match="stopped"):
+            worker.submit(lambda: None)
+
+    def test_queued_jobs_drain_before_shutdown(self):
+        worker = WorkerThread()
+        results = []
+        tasks = [worker.submit(lambda i=i: results.append(i)) for i in range(5)]
+        worker.stop()  # sentinel queued behind the five jobs
+        for t in tasks:
+            t.wait(timeout=1.0)
+        assert results == list(range(5))
+
+
+# ---------------------------------------------------------------------------
+# Custom Task implementations interoperate with the stop-aware primitives
+# ---------------------------------------------------------------------------
+
+
+class CustomTask:
+    """A hand-rolled Task (not derived from the built-ins) that fires its own
+    stop callbacks, so the stop-aware primitives can wake it poll-free."""
+
+    def __init__(self, fn):
+        self.is_done = False
+        self.is_stopped = False
+        self._result = None
+        self._exc = None
+        self._done = threading.Event()
+        self._lock = threading.Lock()
+        self._stop_callbacks = []
+        self._thread = threading.Thread(target=self._run, args=(fn,), daemon=True)
+        self._thread.start()
+
+    def _run(self, fn):
+        with task_context(self, "custom"):
+            try:
+                self._result = fn()
+            except BaseException as e:
+                self._exc = e
+            finally:
+                self.is_done = True
+                self._done.set()
+
+    def wait(self, timeout=None):
+        self._done.wait(timeout)
+        if self._exc is not None:
+            raise self._exc
+        return self._result
+
+    @property
+    def result(self):
+        return self.wait()
+
+    def stop(self):
+        with self._lock:
+            if self.is_stopped:
+                return
+            self.is_stopped = True
+            callbacks, self._stop_callbacks = list(self._stop_callbacks), []
+        for cb in callbacks:
+            cb()
+
+    def add_finish_callback(self, fn):
+        self._done.wait()
+        fn(self._result, self._exc)
+
+    def add_stop_callback(self, fn):
+        with self._lock:
+            if not self.is_stopped:
+                self._stop_callbacks.append(fn)
+                return
+        fn()
+
+    def remove_stop_callback(self, fn):
+        with self._lock:
+            if fn in self._stop_callbacks:
+                self._stop_callbacks.remove(fn)
+
+    def detach(self):
+        pass
+
+
+class TestCustomTask:
+    def test_satisfies_protocol(self):
+        t = CustomTask(lambda: None)
+        t.wait()
+        assert isinstance(t, Task)
+
+    def test_sleep_wakes_poll_free_on_custom_task_stop(self):
+        # The headline contract: a custom Task that implements the stop-callback
+        # hooks gets poll-free wake-up from the built-in primitives.
+        t = CustomTask(lambda: sleep(30))
+        time.sleep(0.05)
+        start = time.monotonic()
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+        assert time.monotonic() - start < 0.5
+
+
+# ---------------------------------------------------------------------------
+# Callback exceptions are logged rather than silently swallowed
+# ---------------------------------------------------------------------------
+
+
+class TestCallbackErrorsLogged:
+    def test_finish_callback_exception_is_logged(self, caplog):
+        def bad(result, exc):
+            raise RuntimeError("bad finish cb")
+
+        with caplog.at_level(logging.ERROR, logger="gentletask"):
+            t = ThreadTask(lambda: 1, on_finish=bad)
+            t.wait()
+            time.sleep(0.05)  # callbacks run just after wait() is released
+        assert "finish callback raised" in caplog.text
+
+    def test_stop_callback_exception_is_logged(self, caplog):
+        def bad():
+            raise RuntimeError("bad stop cb")
+
+        t = ThreadTask(lambda: sleep(10))
+        t.add_stop_callback(bad)
+        time.sleep(0.05)
+        with caplog.at_level(logging.ERROR, logger="gentletask"):
+            t.stop()
+            with pytest.raises(Stopped):
+                t.wait(timeout=1.0)
+        assert "stop callback raised" in caplog.text
