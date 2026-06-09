@@ -499,7 +499,7 @@ print(cd.wait())              # 'liftoff'
 | `add_finish_callback(fn)` | Call `fn(result, exception)` when the task finishes (immediately if already finished). |
 | `add_stop_callback(fn)` | Call zero-arg `fn()` once when the task is stopped (immediately if already stopped). |
 | `remove_stop_callback(fn)` | Unregister a stop callback; no-op if absent. |
-| `detach()` | Remove this task from its parent's stop propagation. |
+| `detach()` | Remove this task from its parent's stop propagation. Parent-only: the caller must be the task whose children include this one (a task cannot detach itself); otherwise raises `RuntimeError`. |
 
 ### Context / throughline
 

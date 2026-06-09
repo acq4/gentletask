@@ -633,11 +633,31 @@ class _TaskCore:
                 pass
 
     def detach(self) -> None:
-        """Remove this task from its parent's stop propagation."""
-        self._detach = True
+        """Remove this task from the calling parent's stop propagation.
+
+        Only a parent may detach one of its own children: the caller's
+        current_task() must be the task whose children include this one. A
+        task therefore cannot detach itself (it is not its own child), and
+        detaching a task that is not the caller's child is rejected. Parents
+        own this decision; a task meant to outlive its creator should instead
+        be created with ``detach=True``.
+
+        Detaching does not touch the throughline. A detached task keeps its
+        narrative ancestry, so logs can still say its work was started in
+        service of the operation that spawned it.
+        """
         parent = current_task()
-        if parent is not None and hasattr(parent, "_children"):
-            parent._children.discard(self)
+        if (
+            parent is None
+            or not hasattr(parent, "_children")
+            or self not in parent._children
+        ):
+            raise RuntimeError(
+                "detach() may only be called by the parent task whose "
+                "children include this task"
+            )
+        self._detach = True
+        parent._children.discard(self)
 
     # -- internals -----------------------------------------------------------
 

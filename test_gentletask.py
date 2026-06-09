@@ -515,6 +515,38 @@ class TestThreadTaskStop:
         time.sleep(0.2)
         assert child_ran == [True]
 
+    def test_task_cannot_detach_itself(self):
+        # Detachment is the parent's decision; a task is not its own child.
+        def fn():
+            current_task().detach()
+
+        t = ThreadTask(fn)
+        with pytest.raises(RuntimeError, match="parent"):
+            t.wait(timeout=1.0)
+
+    def test_detach_outside_a_parent_is_rejected(self):
+        # No current task means no parent to detach from.
+        t = ThreadTask(lambda: sleep(10))
+        try:
+            with pytest.raises(RuntimeError, match="parent"):
+                t.detach()
+        finally:
+            t.stop()
+
+    def test_detach_of_non_child_is_rejected(self):
+        # A task may only detach tasks that are its own children.
+        outsider = ThreadTask(lambda: sleep(10))
+
+        def parent_fn():
+            outsider.detach()  # outsider is not a child of this task
+
+        parent = ThreadTask(parent_fn)
+        try:
+            with pytest.raises(RuntimeError, match="parent"):
+                parent.wait(timeout=1.0)
+        finally:
+            outsider.stop()
+
     def test_del_stops_unwaited_task(self):
         finished = threading.Event()
 
