@@ -14,7 +14,7 @@ import time
 import weakref
 from typing import Any, Callable, Iterable, Iterator, Protocol, runtime_checkable
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 _logger = logging.getLogger(__name__)
 
