@@ -46,9 +46,10 @@ class SemanticStack:
     def walk(self, fn: Callable[[dict[str, Any]], Any]) -> tuple[Any, ...]: ...
     def frames(self) -> tuple[dict[str, Any], ...]: ...
     def snapshot(self) -> "SemanticSnapshot": ...
+    def restore(self, snapshot_or_frames) -> ContextManager[None]: ...
 
 class SemanticSnapshot:
-    def restore(self) -> ContextManager[None]: ...
+    def frames(self) -> tuple[dict[str, Any], ...]: ...
 ```
 
 ### `__call__(**kwargs)`
@@ -104,12 +105,24 @@ throughline.walk(lambda f: f.get("name", "?"))
 Returns the full stack as a tuple of freshly constructed dicts, outermost
 first.
 
-### `snapshot()` / `SemanticSnapshot.restore()`
+### `snapshot()` / `restore()`
 
-`snapshot()` captures the current stack state. `restore()` is a context manager
-that installs the snapshot for the duration of its block, then resets. The
-semantics of restoring into a thread that already has frames are defined by
-tests, not by fiat.
+`snapshot()` captures the current stack state as a pure-data `SemanticSnapshot`
+— just the frames, with no reference back to the stack. A snapshot is therefore
+picklable when its frame values are picklable, and `SemanticSnapshot.frames()`
+exposes the captured frames as fresh dicts (outermost-first, mirroring
+`SemanticStack.frames()`) for callers that want to serialize them.
+
+`stack.restore(snapshot_or_frames)` is a context manager that installs the given
+frames onto *that stack* for the duration of its block, then resets. It accepts
+either a `SemanticSnapshot` or an iterable of frame dicts (so the output of
+`frames()` — a *list* of dicts after a serialization round-trip, or a tuple —
+can be restored directly). Restoration is a **replay** of already-validated
+frames, so it **bypasses** the `required`-key validation `__call__` enforces:
+the frames may have come from a stack with different required keys, or from
+another process entirely, and are not re-validated. The semantics of restoring
+into a thread that already has frames (they are hidden, not merged) are defined
+by tests, not by fiat.
 
 ---
 
@@ -185,6 +198,13 @@ All values set by the gentletask library will be pickleable, and so long as your
 code adheres to that restriction, the throughline can be copied across process
 boundaries. `teleprox` makes use of this, as an example.
 
+Because a `SemanticSnapshot` is pure data (no stack reference), it can be
+pickled, sent to another process, and restored into that process's same-named
+singleton — `throughline.restore(snapshot)` (or, equivalently, restoring a
+serialized `frames()` payload, a list of dicts, via `throughline.restore(frames)`).
+Restore bypasses required-key validation, so a frames payload built without the
+throughline's required `name` key still replays cleanly.
+
 ---
 
 ## `SemanticStack` outside of tasks
@@ -244,10 +264,22 @@ poll-free.
 Runs a callable in a new daemon thread.
 
 ```python
-task = ThreadTask(fn, args=(), kwargs=None, name=None, detach=False, on_finish=None)
+task = ThreadTask(fn, args=(), kwargs=None, name=None, detach=False, on_finish=None, start=True)
 # Alternately, as a decorator:
 task = asynch(fn, name=None, detach=False, on_finish=None)(*args, **kwargs)
 ```
+
+**Deferred start.** With `start=True` (default) the thread is launched at the
+end of `__init__`. With `start=False` the thread is created but not launched;
+the caller calls `.start()` to begin work. This lets a caller attach
+finish/stop callbacks or connect signals BEFORE any work runs, race-free:
+construct, register callbacks, then `start()`. `.start()` is idempotent — a
+second call (or calling it on a task already auto-started by `start=True`) is a
+safe no-op. Context capture (`copy_context()`) and parent registration both
+still happen at construction time, NOT at `start()`: the task inherits the
+context of the code that *created* it, and registers in the parent's child set
+immediately so a parent stop reaches even a not-yet-started child. `asynch()` is
+a launcher and always starts immediately.
 
 **Context inheritance.** Uses `contextvars.copy_context()` so the thread starts
 with the caller's stack state (both stacks). The task then enters its own frame
@@ -318,7 +350,7 @@ picks up the job it restores both snapshots, then enters its own frame on each
 via `task_context`:
 
 ```python
-with throughline_snapshot.restore(), task_snapshot.restore():
+with throughline.restore(throughline_snapshot), _task_stack.restore(task_snapshot):
     with task_context(self, self.name):
         fn(*args, **kwargs)
 ```

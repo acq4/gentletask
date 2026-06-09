@@ -113,31 +113,66 @@ class SemanticStack:
         return tuple(dict(frame) for frame in self._var.get())
 
     def snapshot(self) -> "SemanticSnapshot":
-        """Capture the current stack state for later restoration."""
-        return SemanticSnapshot(self, self._var.get())
+        """Capture the current stack state as pure data for later restoration.
 
-
-class SemanticSnapshot:
-    """An immutable capture of a SemanticStack's frames at a point in time."""
-
-    def __init__(self, stack: SemanticStack, frames: tuple[Frame, ...]) -> None:
-        self._stack = stack
-        self._frames = frames
+        The returned snapshot holds only the captured frames — no reference to
+        this stack — so it is picklable (when its values are) and can be
+        restored into any same-shaped stack via ``stack.restore()``.
+        """
+        return SemanticSnapshot(self._var.get())
 
     @contextlib.contextmanager
-    def restore(self) -> Iterator[None]:
-        """Install the captured frames as the current stack for this block.
+    def restore(
+        self, snapshot_or_frames: "SemanticSnapshot | Iterable[dict[str, Any]]"
+    ) -> Iterator[None]:
+        """Install the given frames onto THIS stack for the block, then reset.
+
+        Accepts either a ``SemanticSnapshot`` or an iterable of frame dicts
+        (e.g. the output of ``frames()``, which after a serialization round-trip
+        is a *list* of dicts) — both list and tuple forms are handled.
 
         Restoring replaces whatever frames are currently on the stack for the
         duration of the block; on exit the previous state is reset. A thread
         that already had frames sees them hidden — not merged — while the
-        snapshot is active.
+        restored frames are active.
+
+        Restoration is a REPLAY of already-validated frames, so it BYPASSES the
+        ``required``-key check that ``__call__`` enforces: the frames may have
+        been produced by a stack with different required keys (or by another
+        process entirely), and must not be re-validated here.
         """
-        token = self._stack._var.set(self._frames)
+        if isinstance(snapshot_or_frames, SemanticSnapshot):
+            frames = snapshot_or_frames._frames
+        else:
+            # An iterable of dicts (list or tuple), e.g. from a serialized
+            # frames() payload. Convert each to a structurally-immutable Frame.
+            frames = tuple(tuple(d.items()) for d in snapshot_or_frames)
+        token = self._var.set(frames)
         try:
             yield
         finally:
-            self._stack._var.reset(token)
+            self._var.reset(token)
+
+
+class SemanticSnapshot:
+    """An immutable, pure-data capture of a stack's frames at a point in time.
+
+    Holds only the captured frames — no reference to the originating stack — so
+    it is picklable when its frame values are picklable, and can therefore cross
+    both thread and process boundaries. Restore it onto any stack via
+    ``stack.restore(snapshot)``.
+    """
+
+    def __init__(self, frames: tuple[Frame, ...]) -> None:
+        self._frames = frames
+
+    def frames(self) -> tuple[dict[str, Any], ...]:
+        """Return the captured frames as fresh dicts, outermost-first.
+
+        Mirrors ``SemanticStack.frames()`` output shape, for callers that want
+        to serialize the snapshot's contents.
+        """
+        return tuple(dict(frame) for frame in self._frames)
 
 
 # ---------------------------------------------------------------------------
@@ -717,12 +752,28 @@ class ThreadTask(_TaskCore):
         name: str | None = None,
         detach: bool = False,
         on_finish: Callable[[Any, BaseException | None], Any] | None = None,
+        start: bool = True,
     ) -> None:
+        """Run fn in a new daemon thread.
+
+        With ``start=True`` (default) the thread is created and launched here,
+        as before. With ``start=False`` the thread is created but not launched;
+        the caller must call ``.start()`` to begin work. Deferred start lets a
+        caller attach finish/stop callbacks or connect signals BEFORE any work
+        runs, race-free: construct, register callbacks, then ``start()``. (This
+        is what acq4's Qt bridge needs: construct the QObject, connect Qt
+        signals, then start.) ``asynch()`` always starts immediately.
+        """
         super().__init__(fn, tuple(args), kwargs or {}, name, on_finish)
         self._detach = detach
         self._waited = False
+        self._started = False
 
-        # Register with the parent task (if any) so stop cascades.
+        # Context capture and parent registration both happen at construction
+        # time, NOT at start() time, regardless of `start`. The task inherits
+        # the context of the code that *created* it (copy_context here), and
+        # registers in the parent's child set immediately so a parent stop
+        # reaches even a not-yet-started child.
         self._register_with_parent()
 
         # Copy the calling context so the thread inherits both stacks (the
@@ -734,6 +785,19 @@ class ThreadTask(_TaskCore):
             daemon=True,
             name=self._name,
         )
+        if start:
+            self.start()
+
+    def start(self) -> None:
+        """Launch the daemon thread. Idempotent — extra calls are a no-op.
+
+        Calling start() on a task created with ``start=True`` (already running)
+        is also a no-op, so the method is always safe to call.
+        """
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
         self._thread.start()
 
     def wait(self, timeout: float | None = None) -> Any:
@@ -841,7 +905,10 @@ class WorkTask(_TaskCore):
 
     def _execute(self) -> None:
         """Run the job body. Called by the worker thread."""
-        with self._throughline_snapshot.restore(), self._task_snapshot.restore():
+        with (
+            throughline.restore(self._throughline_snapshot),
+            _task_stack.restore(self._task_snapshot),
+        ):
             with task_context(self, self._name):
                 result = None
                 exc: BaseException | None = None

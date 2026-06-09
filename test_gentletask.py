@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import pickle
 import threading
 import time
 
@@ -14,6 +15,7 @@ import pytest
 from gentletask import (
     Event,
     Queue,
+    SemanticSnapshot,
     SemanticStack,
     Stopped,
     Task,
@@ -32,7 +34,6 @@ from gentletask import (
     throughline,
 )
 from gentletask import _task_stack
-
 
 # ---------------------------------------------------------------------------
 # SemanticStack
@@ -193,7 +194,7 @@ class TestSemanticSnapshot:
         # Outside the original frame the stack is empty again...
         assert s.collect("name") == ()
         # ...but restore brings the captured frames back.
-        with snap.restore():
+        with s.restore(snap):
             assert s.collect("name") == ("captured",)
         assert s.collect("name") == ()
 
@@ -205,7 +206,7 @@ class TestSemanticSnapshot:
             snap = s.snapshot()
         with s(name="live"):
             assert s.collect("name") == ("live",)
-            with snap.restore():
+            with s.restore(snap):
                 assert s.collect("name") == ("captured",)
             # Live frame comes back after the snapshot block ends.
             assert s.collect("name") == ("live",)
@@ -214,10 +215,69 @@ class TestSemanticSnapshot:
         s = SemanticStack()
         with s(name="base"):
             snap = s.snapshot()
-        with snap.restore():
+        with s.restore(snap):
             with s(name="added"):
                 assert s.collect("name") == ("base", "added")
             assert s.collect("name") == ("base",)
+
+    def test_snapshot_holds_no_stack_reference(self):
+        # A snapshot is pure data: it does not retain its originating stack.
+        s = SemanticStack()
+        with s(name="captured", request_id="r-1"):
+            snap = s.snapshot()
+        assert not hasattr(snap, "_stack")
+
+    def test_snapshot_frames_returns_dicts_outermost_first(self):
+        s = SemanticStack()
+        with s(name="outer"):
+            with s(name="inner", extra=1):
+                snap = s.snapshot()
+        assert snap.frames() == ({"name": "outer"}, {"name": "inner", "extra": 1})
+
+    def test_snapshot_is_picklable_and_restores(self):
+        s = SemanticStack()
+        with s(name="captured", request_id="r-42"):
+            snap = s.snapshot()
+        revived = pickle.loads(pickle.dumps(snap))
+        with s.restore(revived):
+            assert s.collect("name") == ("captured",)
+            assert s.get("request_id") == "r-42"
+        assert s.collect("name") == ()
+
+    def test_restore_accepts_list_of_dicts(self):
+        # Simulate a serialized payload arriving as a *list* of dicts
+        # (what frames() looks like after a msgpack/JSON round-trip).
+        s = SemanticStack()
+        payload = [{"name": "outer"}, {"name": "inner", "extra": 1}]
+        with s.restore(payload):
+            assert s.collect("name") == ("outer", "inner")
+            assert s.get("extra") == 1
+        assert s.collect("name") == ()
+
+    def test_restore_accepts_tuple_of_dicts(self):
+        s = SemanticStack()
+        payload = ({"name": "outer"}, {"name": "inner"})
+        with s.restore(payload):
+            assert s.collect("name") == ("outer", "inner")
+
+    def test_restore_bypasses_required_key_validation(self):
+        # Frames captured from a stack with no required keys can be replayed
+        # into a stack that *does* require keys — restore is a replay, not a
+        # fresh frame, so validation is skipped.
+        plain = SemanticStack("plain")
+        with plain(other="x"):  # no "name" key at all
+            snap = plain.snapshot()
+        required = SemanticStack("required", required=("name",))
+        # No ValueError despite the missing required "name" key.
+        with required.restore(snap):
+            assert required.get("other") == "x"
+
+    def test_restore_into_throughline_singleton_bypasses_required(self):
+        # A frames payload produced elsewhere (e.g. another process) without a
+        # "name" key can still be restored into the throughline singleton.
+        payload = [{"request_id": "r-1"}]
+        with throughline.restore(payload):
+            assert throughline.get("request_id") == "r-1"
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +515,100 @@ class TestThreadTask:
         barrier.wait()
         t.wait(timeout=1.0)
         assert t.is_stopped
+
+
+# ---------------------------------------------------------------------------
+# ThreadTask — deferred start
+# ---------------------------------------------------------------------------
+
+
+class TestThreadTaskDeferredStart:
+    def test_default_starts_immediately(self):
+        t = ThreadTask(lambda: 42)
+        assert t.wait() == 42
+
+    def test_start_false_does_not_run_body_until_start(self):
+        ran = threading.Event()
+
+        def fn():
+            ran.set()
+
+        t = ThreadTask(fn, start=False)
+        # Body must not run before .start().
+        assert not ran.wait(0.1)
+        assert not t.is_done
+        t.start()
+        assert ran.wait(1.0)
+        t.wait(timeout=1.0)
+        assert t.is_done
+
+    def test_callback_registered_before_start_fires_with_no_race(self):
+        # The whole point of deferred start: attach a finish callback before
+        # any work runs, race-free.
+        results = []
+
+        def fn():
+            return 7
+
+        t = ThreadTask(fn, start=False)
+        t.add_finish_callback(lambda r, e: results.append((r, e)))
+        t.start()
+        t.wait(timeout=1.0)
+        assert results == [(7, None)]
+
+    def test_stop_callback_registered_before_start_fires(self):
+        fired = []
+
+        def fn():
+            sleep(10)
+
+        t = ThreadTask(fn, start=False)
+        t.add_stop_callback(lambda: fired.append(True))
+        t.start()
+        t.stop()
+        assert fired == [True]
+
+    def test_unstarted_child_is_stopped_when_parent_stops(self):
+        # A child constructed (and registered) but not yet started must still
+        # receive a stop when its parent stops.
+        child_holder = {}
+        parent_proceed = threading.Event()
+
+        def parent_fn():
+            child = ThreadTask(lambda: sleep(10), name="child", start=False)
+            child_holder["child"] = child
+            parent_proceed.set()
+            sleep(10)
+
+        parent = ThreadTask(parent_fn, name="parent")
+        assert parent_proceed.wait(1.0)
+        child = child_holder["child"]
+        parent.stop()
+        # The not-yet-started child received the stop cascade.
+        assert child.is_stopped
+
+    def test_double_start_is_noop(self):
+        ran = []
+        t = ThreadTask(lambda: ran.append(1), start=False)
+        t.start()
+        t.start()  # second start is a safe no-op
+        t.wait(timeout=1.0)
+        assert ran == [1]
+
+    def test_start_after_auto_started_is_noop(self):
+        t = ThreadTask(lambda: 99)
+        t.wait(timeout=1.0)
+        # start=True already launched it; calling start() again is a no-op.
+        t.start()
+        assert t.wait() == 99
+
+    def test_wait_on_unstarted_times_out(self):
+        t = ThreadTask(lambda: 1, start=False)
+        # Not started, so it never completes; wait should time out -> None.
+        assert t.wait(timeout=0.1) is None
+        assert not t.is_done
+        t.start()
+        assert t.wait(timeout=1.0) == 1
 
 
 # ---------------------------------------------------------------------------

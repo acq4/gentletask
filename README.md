@@ -172,9 +172,10 @@ labeled(extra="but no name")                  # raises ValueError: missing "name
 
 ### Snapshots
 
-`snapshot()` captures the current frames; the returned `SemanticSnapshot`'s
-`restore()` is a context manager that reinstalls them for a block. This is the
-machinery that carries context onto worker threads.
+`snapshot()` captures the current frames as a pure-data `SemanticSnapshot` (just
+the frames, no stack reference); `stack.restore(snapshot)` is a context manager
+that reinstalls them onto that stack for a block. This is the machinery that
+carries context onto worker threads.
 
 ```python
 from gentletask import throughline
@@ -184,9 +185,28 @@ with throughline(name="request_handler", request_id="r-42"):
 
 print(throughline.collect("name"))   # () — back outside, the stack is empty
 
-with snap.restore():
+with throughline.restore(snap):
     print(throughline.collect("name"), throughline.get("request_id"))
     # ('request_handler',) r-42
+```
+
+Because a snapshot is plain data, it is picklable (when its values are) and can
+cross both thread and process boundaries. `restore()` also accepts a raw
+iterable of frame dicts — e.g. `snap.frames()` after a serialization round-trip
+returns a *list* of dicts — and replays already-validated frames, so it bypasses
+the `required`-key check that `__call__` enforces:
+
+```python
+import pickle
+
+payload = pickle.dumps(snap)          # send to another process...
+revived = pickle.loads(payload)       # ...and restore into the same singleton
+with throughline.restore(revived):
+    print(throughline.get("request_id"))   # r-42
+
+# Or restore a serialized frames() payload (a list of dicts) directly:
+with throughline.restore([{"name": "request_handler", "request_id": "r-42"}]):
+    ...
 ```
 
 ### `ThreadTask`
@@ -227,6 +247,20 @@ t = ThreadTask(
 )
 print(t.wait())     # 7
 print(log_lines)    # ['adder finished -> 7']
+```
+
+Pass `start=False` to create the thread without launching it, then call
+`.start()` once you have wired up callbacks. This lets you attach finish/stop
+callbacks (or connect signals) before any work runs, race-free. `.start()` is
+idempotent — a second call, or calling it on a task already started by the
+default `start=True`, is a safe no-op. Context and parent registration are
+still captured at construction time, so a not-yet-started child is stopped if
+its parent stops.
+
+```python
+t = ThreadTask(work, start=False)
+t.add_finish_callback(on_done)   # registered before any work runs
+t.start()
 ```
 
 ### `asynch` and `synch`
@@ -512,7 +546,7 @@ to use the stop-aware primitives.
 | Name | Description |
 | --- | --- |
 | `Task` | `runtime_checkable` structural `Protocol` for a stoppable, waitable unit of work. |
-| `ThreadTask(fn, args=(), kwargs=None, *, name=None, detach=False, on_finish=None)` | Runs `fn` in a new daemon thread; implements `Task`. |
+| `ThreadTask(fn, args=(), kwargs=None, *, name=None, detach=False, on_finish=None, start=True)` | Runs `fn` in a new daemon thread; implements `Task`. With `start=False`, call `.start()` to launch (idempotent). |
 | `WorkTask(fn, args, kwargs, name=None)` | One job queued to a `WorkerThread`; implements `Task`. Usually created via `WorkerThread.submit`. |
 | `WorkerThread(name=None)` | Long-lived worker thread that serializes submitted jobs. `submit(...)` returns a `WorkTask`; `stop()` drains queued jobs and shuts down. |
 | `asynch(fn, name=None, detach=False, on_finish=None)` | Returns a launcher that starts `fn` in a new `ThreadTask` when called. |
@@ -542,8 +576,9 @@ to use the stop-aware primitives.
 | `SemanticStack.collect(key)` | Tuple of all values for `key`, outermost-first. |
 | `SemanticStack.walk(fn)` | Apply `fn` to each frame dict, outermost-first; return a tuple of results. |
 | `SemanticStack.frames()` | Full stack as fresh dicts, outermost-first. |
-| `SemanticStack.snapshot()` | Capture current state as a `SemanticSnapshot`. |
-| `SemanticSnapshot.restore()` | Context manager that installs the captured frames for the block. |
+| `SemanticStack.snapshot()` | Capture current state as a pure-data `SemanticSnapshot` (picklable). |
+| `SemanticStack.restore(snapshot_or_frames)` | Context manager that installs a snapshot (or an iterable of frame dicts) onto this stack for the block; replays without `required`-key validation. |
+| `SemanticSnapshot.frames()` | Captured frames as fresh dicts, outermost-first (for serialization). |
 | `throughline` | Module singleton `SemanticStack("throughline", required=("name",))` — the human-readable narrative. |
 | `task_context(task, name)` | Context manager that enters `name` on the throughline and `task` on the private task stack. |
 | `current_task()` | The innermost running `Task`, or `None` outside any task. |
