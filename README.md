@@ -402,8 +402,12 @@ class CountdownTask:
         self.is_stopped = False
         self.is_done = False
         self._result = None
-        self._done = threading.Event()
-        self._lock = threading.Lock()
+        # Internal plumbing uses plain threading primitives, NOT gentletask's.
+        # These coordinate the task's own lifecycle and are read from outside
+        # the task (e.g. wait() is usually called by a parent), so they must
+        # not raise Stopped based on the caller's current_task().
+        self._done = threading.Event()  # completion signal
+        self._lock = threading.Lock()  # guards the stop-callback list
         self._stop_callbacks = []
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -413,7 +417,9 @@ class CountdownTask:
             try:
                 while self._n > 0 and not self.is_stopped:
                     self._n -= 1
-                    sleep(0.01)  # poll-free: woken instantly by stop()
+                    # The actual work waits with gentletask.sleep so a stop
+                    # aborts it cooperatively (poll-free, raises Stopped).
+                    sleep(0.01)
                 self._result = "liftoff" if not self.is_stopped else "aborted"
             finally:
                 self.is_done = True
@@ -465,6 +471,31 @@ print(cd.wait())              # 'liftoff'
 > the behavior the primitives rely on. Implement all of the protocol members,
 > especially the stop-callback hooks, for a task that participates fully in
 > poll-free stopping.
+
+### `threading` or `gentletask`? When to use which
+
+The example above deliberately mixes the two, and the choice is not arbitrary.
+The rule of thumb:
+
+- Use the **`gentletask`** primitives (`sleep`, `Event`, `Queue`, `poll`,
+  `check_stop`) for the **work a task performs** — the wait points that should
+  abort with `Stopped` when *that* task is stopped. These are stop-aware: they
+  consult `current_task()` and raise `Stopped` so a cooperative stop unwinds the
+  work cleanly. Reach for these whenever you are blocking *inside* a task and
+  want the block to be interruptible.
+- Use the plain **`threading`** primitives (`threading.Event`, `Lock`,
+  `Thread`, `queue.Queue`) for a task's **own lifecycle machinery** — completion
+  signals, internal locks, the worker thread itself. This plumbing is read and
+  driven from *outside* the running task (a parent calls `wait()`, `stop()` may
+  fire from any thread), so it must **not** be stop-aware: a `gentletask.Event`
+  used for `self._done` would raise `Stopped` if `wait()` happened to be called
+  from some unrelated stopped task, corrupting the task's own bookkeeping.
+
+In short: **`gentletask` primitives for interruptible work; `threading`
+primitives for the scaffolding that makes a task a task.** The built-in
+`ThreadTask` and `WorkTask` follow exactly this split internally — their
+done/stop signaling is `threading`-based, while the work you hand them is free
+to use the stop-aware primitives.
 
 ---
 
