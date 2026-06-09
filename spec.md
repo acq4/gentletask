@@ -269,23 +269,29 @@ called automatically calls `stop()` on itself and its children.
 `asynch(fn, ...)` returns a launcher: calling it starts `fn` in a `ThreadTask`
 and returns the task. It is the asynchronous wrapper.
 
-`synch(fn)` is its inverse — a de-wrapper. It returns a *synchronous* version
-of `fn`:
+`synch(fn)` returns a *synchronous* version of `fn` that always yields a
+concrete value. It flattens two layers of asynchrony:
 
-- If `fn` was produced by `asynch()`, `synch` returns the original callable it
-  wraps. Calling that runs in the current thread and returns the value
-  directly, with no `ThreadTask`. Thus `synch(asynch(f)) is f`.
-- If `fn` is any other callable, it is already synchronous and is returned
-  unchanged.
+- **The `asynch` wrapper.** If `fn` was produced by `asynch()`, it is de-wrapped
+  to the original callable, so the work runs inline in the current thread with
+  no extra `ThreadTask`.
+- **A returned task.** When the (de-wrapped) callable is invoked and returns a
+  value that implements the `Task` protocol, `synch` waits for that task and
+  returns its result instead of the task itself.
 
-`synch` is therefore safe to apply regardless of whether a function was
-asynch-wrapped, which makes it useful at call sites that accept either form and
-just need to run the work and get a value.
+A plain callable returning a plain value is simply called and its value
+returned. `synch` is therefore safe to apply regardless of whether a function
+was asynch-wrapped or returns a task — useful at call sites that accept either
+form and just need to run the work and get a value.
 
 ```python
 job = asynch(process)          # job(...) -> ThreadTask
-result = synch(job)(img)       # runs process(img) inline, returns the value
-result = synch(process)(img)   # same — process was already synchronous
+result = synch(job)(img)       # de-wraps, runs process(img) inline, returns value
+result = synch(process)(img)   # plain function: just called, value returned
+
+def schedule(img):             # a function that hands back a task
+    return worker.submit(process, (img,))
+result = synch(schedule)(img)  # waits for the WorkTask, returns its result
 ```
 
 ---

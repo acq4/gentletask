@@ -427,40 +427,59 @@ class TestAsynch:
 
 
 class TestSynch:
-    def test_dewraps_asynch_to_original(self):
-        def fn():
-            return 1
+    def test_plain_function_runs_and_returns_value(self):
+        assert synch(lambda x: x + 1)(1) == 2
 
-        assert synch(asynch(fn)) is fn
+    def test_non_task_return_passed_through(self):
+        assert synch(lambda: 5)() == 5
 
-    def test_dewraps_regardless_of_asynch_options(self):
-        def fn():
-            return 1
-
-        wrapped = asynch(fn, name="named", detach=True)
-        assert synch(wrapped) is fn
-
-    def test_plain_function_returned_unchanged(self):
-        def fn():
-            return 1
-
-        assert synch(fn) is fn
-
-    def test_synch_result_runs_synchronously(self):
-        # The de-wrapped callable returns the value directly, not a ThreadTask.
+    def test_synch_of_asynch_returns_value_not_task(self):
+        # asynch(f) hands back a Task when called; synch flattens both the
+        # wrapper and the task to the concrete value.
         result = synch(asynch(lambda x, y: x + y))(3, 4)
         assert result == 7
 
-    def test_synch_runs_in_current_thread(self):
-        # No new task is spawned: current_task() inside is whatever the caller's
-        # task is (None at top level).
+    def test_synch_dewraps_asynch_and_runs_in_current_thread(self):
+        # The asynch layer is de-wrapped, so the work runs inline: no new task
+        # is spawned and current_task() is the caller's (None at top level).
         seen = []
         synch(asynch(lambda: seen.append(current_task())))()
         assert seen == [None]
 
-    def test_idempotent_on_plain_function(self):
-        f = synch(asynch(lambda: 1))
-        assert synch(f) is f
+    def test_waits_for_returned_thread_task(self):
+        # A plain function that returns a ThreadTask: synch waits for it.
+        def make():
+            return ThreadTask(lambda: 42)
+
+        assert synch(make)() == 42
+
+    def test_waits_for_returned_work_task(self):
+        worker = WorkerThread()
+
+        def make():
+            return worker.submit(lambda: "done")
+
+        try:
+            assert synch(make)() == "done"
+        finally:
+            worker.stop()
+
+    def test_propagates_exception_from_returned_task(self):
+        def boom():
+            raise ValueError("nope")
+
+        def make():
+            return ThreadTask(boom)
+
+        with pytest.raises(ValueError, match="nope"):
+            synch(make)()
+
+    def test_dewrapped_function_returning_task_is_waited(self):
+        # Combine both layers: asynch-wrapped function whose body returns a task.
+        def make():
+            return ThreadTask(lambda: 7)
+
+        assert synch(asynch(make))() == 7
 
 
 # ---------------------------------------------------------------------------

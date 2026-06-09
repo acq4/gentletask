@@ -586,15 +586,30 @@ def asynch(
 
 
 def synch(fn: Callable) -> Callable:
-    """Return a synchronous version of *fn*.
+    """Return a synchronous version of *fn* that yields a concrete value.
 
-    If *fn* was produced by asynch(), return the original callable it wraps —
-    calling that runs in the current thread and returns the value directly,
-    with no ThreadTask. If *fn* is any other callable it is already
-    synchronous and is returned unchanged. So ``synch(asynch(f)) is f``, and
-    synch is safe to apply whether or not a function was asynch-wrapped.
+    Flattens two layers of asynchrony:
+
+    - If *fn* was produced by asynch(), it is de-wrapped to the original
+      callable, so the work runs inline in the current thread with no extra
+      ThreadTask.
+    - When the (de-wrapped) callable is invoked and returns a value that
+      implements the Task protocol, synch waits for that task and returns its
+      result instead of the task itself.
+
+    A plain callable returning a plain value is simply called and its value
+    returned. synch is safe to apply whether or not a function was
+    asynch-wrapped or returns a task.
     """
-    return getattr(fn, "_asynch_wraps", fn)
+    target = getattr(fn, "_asynch_wraps", fn)
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        result = target(*args, **kwargs)
+        if isinstance(result, Task):
+            return result.wait()
+        return result
+
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
