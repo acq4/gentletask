@@ -421,6 +421,20 @@ class TestPollFreeWake:
             t.wait(timeout=1.0)
         assert time.monotonic() - start < 0.5
 
+    def test_infinite_sleep_waits_until_stopped(self):
+        # sleep(inf) means "wait until stopped" — it must not overflow
+        # (Event.wait cannot take a non-finite timeout) and must wake on stop.
+        def fn():
+            sleep(float("inf"))
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        start = time.monotonic()
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+        assert time.monotonic() - start < 0.5
+
     def test_queue_get_wakes_on_stop_with_no_timeout(self):
         q = Queue()
 

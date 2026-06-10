@@ -359,8 +359,11 @@ def sleep(seconds: float) -> None:
         if task.is_stopped:
             raise _stopped(_task_stop_reason(task))
         # woken.wait() returns True only if stop() set the event; a timeout
-        # (the full sleep elapsed without a stop) returns False.
-        if woken.wait(seconds):
+        # (the full sleep elapsed without a stop) returns False. A non-finite
+        # duration means "wait until stopped" — Event.wait cannot take an
+        # infinite timeout, so pass None to block until the stop signal arrives.
+        timeout = None if seconds == float("inf") else seconds
+        if woken.wait(timeout):
             raise _stopped(_task_stop_reason(task))
 
 
