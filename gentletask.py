@@ -53,6 +53,21 @@ def _task_stop_reason(task: "Task | None") -> str | None:
     return getattr(task, "_stop_reason", None)
 
 
+def _stop_child(task: "Task", reason: str | None) -> None:
+    """Stop *task*, forwarding *reason*, tolerating a reason-less ``stop()``.
+
+    The Task protocol declares ``stop(reason=None)``, but a hand-rolled Task may
+    predate the reason parameter and define ``stop()`` with no argument. Such a
+    task still satisfies the protocol structurally, so a cascade must not break
+    on it: a binding ``TypeError`` (raised before the body runs, so there is no
+    double-stop) falls back to a reason-less stop.
+    """
+    try:
+        task.stop(reason)
+    except TypeError:
+        task.stop()
+
+
 class MultiException(Exception):
     """Aggregate of several child exceptions raised by a MultiTask.
 
@@ -689,7 +704,7 @@ class _TaskCore:
             except Exception:
                 _logger.exception("stop callback raised")
         for child in children:
-            child.stop(reason)
+            _stop_child(child, reason)
 
     def add_finish_callback(
         self, fn: Callable[[Any, BaseException | None], Any]
@@ -761,16 +776,20 @@ class _TaskCore:
             parent._children.add(self)
 
     def _finish(self, result: Any = None, exc: BaseException | None = None) -> None:
-        self._result = result
-        self._exception = exc
-        self._mark_done()
+        """Complete the task; the first completion wins, later calls are no-ops.
 
-    def _mark_done(self) -> None:
-        """Mark the task done, wake any waiters poll-free, then run callbacks.
-
-        ``self._result`` / ``self._exception`` must already be set.
+        Recording the result/exception and marking done happen together under
+        the lock, so concurrent completers — e.g. ``resolve()`` racing
+        ``fail()``, or a stop callback resolving a Promise while ``stop()``
+        injects ``Stopped`` — cannot interleave and overwrite each other's
+        outcome. Waiters are woken poll-free; callbacks run after the lock is
+        released (a finish callback may take other locks).
         """
         with self._cond:
+            if self._done.is_set():
+                return
+            self._result = result
+            self._exception = exc
             self._done.set()
             self._cond.notify_all()
         self._run_callbacks()
@@ -787,9 +806,10 @@ class _TaskCore:
     def _stop_running_children(self) -> None:
         with self._lock:
             children = list(self._children)
+            reason = self._stop_reason
         for child in children:
             if not child.is_done:
-                child.stop()
+                _stop_child(child, reason)
 
 
 # ---------------------------------------------------------------------------
@@ -1044,11 +1064,9 @@ class Promise(_TaskCore):
 
         Idempotent: a no-op if the promise is already resolved, failed, or
         stopped. Otherwise wakes any waiters poll-free and fires finish
-        callbacks with ``(value, None)``.
+        callbacks with ``(value, None)``. ``_finish`` is the single completion
+        gate, so the first of several racing completers wins.
         """
-        with self._lock:
-            if self._done.is_set():
-                return
         self._finish(result=value)
 
     def fail(self, exc: BaseException) -> None:
@@ -1056,11 +1074,9 @@ class Promise(_TaskCore):
 
         Idempotent: a no-op if the promise is already done. Otherwise wakes any
         waiters poll-free; ``wait()`` will re-raise *exc* and finish callbacks
-        fire with ``(None, exc)``.
+        fire with ``(None, exc)``. ``_finish`` is the single completion gate, so
+        the first of several racing completers wins.
         """
-        with self._lock:
-            if self._done.is_set():
-                return
         self._finish(exc=exc)
 
     def stop(self, reason: str | None = None) -> None:
@@ -1070,15 +1086,13 @@ class Promise(_TaskCore):
         itself or its waiters would hang forever. ``super().stop()`` runs first:
         it sets the stop flag (recording *reason*), fires stop callbacks (so an
         external producer can abort its side-effects), and cascades to children.
-        A stop callback may legitimately resolve or fail the promise, so we only
-        inject ``Stopped`` if the promise is still incomplete afterwards. The
-        injected ``Stopped`` carries the recorded reason so a stopped promise's
-        waiters learn WHY. Idempotent via ``super().stop()``'s own guard.
+        A stop callback may legitimately resolve or fail the promise; ``_finish``
+        is idempotent, so the injected ``Stopped`` is a no-op when the promise is
+        already complete and otherwise wins. The injected ``Stopped`` carries the
+        recorded reason so a stopped promise's waiters learn WHY. Idempotent via
+        ``super().stop()``'s own guard.
         """
         super().stop(reason)
-        with self._lock:
-            if self._done.is_set():
-                return
         self._finish(exc=_stopped(self._stop_reason))
 
     def __repr__(self) -> str:
@@ -1177,7 +1191,16 @@ class MultiTask(_TaskCore):
             # parent's child set is unordered). Either way the outcome is a stop,
             # so report a single Stopped rather than a MultiException of the
             # children's Stoppeds. stop() also self-completes as a backstop.
-            self._finish(exc=_stopped(self._stop_reason))
+            reason = self._stop_reason
+            if reason is None:
+                # A grandparent stop reached the children before us, so our own
+                # reason is not set yet. Recover it from a child's Stopped so the
+                # single Stopped we report still explains itself.
+                reason = next(
+                    (str(e) for e in excs if isinstance(e, Stopped) and str(e)),
+                    None,
+                )
+            self._finish(exc=_stopped(reason))
         elif not excs:
             self._finish(result=results)
         elif len(excs) == 1:
@@ -1202,10 +1225,7 @@ class MultiTask(_TaskCore):
         # the reason and fires our stop callbacks.
         super().stop(reason)
         for t in self._tasks:
-            t.stop(reason)
-        with self._lock:
-            if self._done.is_set():
-                return
+            _stop_child(t, reason)
         self._finish(exc=_stopped(self._stop_reason))
 
     def __repr__(self) -> str:
