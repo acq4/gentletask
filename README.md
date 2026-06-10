@@ -45,9 +45,10 @@ dependencies**.
 
 A **Task** is anything that satisfies the `Task` protocol — a unit of work that
 can report whether it is `is_done` / `is_stopped`, be `wait()`-ed on, and be
-asked to `stop()`. The two built-in implementations are `ThreadTask` (runs a
-callable in its own daemon thread) and `WorkTask` (one job queued to a
-long-lived `WorkerThread`).
+asked to `stop()`. The built-in implementations are `ThreadTask` (runs a
+callable in its own daemon thread), `WorkTask` (one job queued to a long-lived
+`WorkerThread`), and `Promise` (no thread or body — completed externally by an
+already-existing producer).
 
 Tasks form a hierarchy automatically: when a task is created or waited on from
 *inside* another running task, it registers as a **child** of that task. Calling
@@ -59,6 +60,13 @@ Stopping is **cooperative**: a task is never interrupted mid-statement. Instead,
 the stop-aware blocking primitives (`sleep`, `check_stop`, `Queue.get`,
 `Event.wait`, `poll`, and `Task.wait`) notice the stop at their wait site and
 raise `Stopped`, which unwinds normally so your `finally` blocks run.
+
+`stop()` takes an optional `reason` string for diagnostics. The first stop on a
+task records its reason (a later stop is a no-op and does not overwrite it),
+which then travels into the `Stopped` exception raised at the wait site — so
+`str(exc)` is the reason — and cascades along with the stop into children. A
+plain `stop()` with no reason behaves exactly as before, yielding a reason-less
+`Stopped()`. Read the recorded reason back via the `stop_reason` property.
 
 Stop propagation is **poll-free**: `stop()` *pushes* a notification rather than
 relying on a polling loop. Before a primitive parks, it registers a zero-arg
@@ -172,9 +180,10 @@ labeled(extra="but no name")                  # raises ValueError: missing "name
 
 ### Snapshots
 
-`snapshot()` captures the current frames; the returned `SemanticSnapshot`'s
-`restore()` is a context manager that reinstalls them for a block. This is the
-machinery that carries context onto worker threads.
+`snapshot()` captures the current frames as a pure-data `SemanticSnapshot` (just
+the frames, no stack reference); `stack.restore(snapshot)` is a context manager
+that reinstalls them onto that stack for a block. This is the machinery that
+carries context onto worker threads.
 
 ```python
 from gentletask import throughline
@@ -184,9 +193,28 @@ with throughline(name="request_handler", request_id="r-42"):
 
 print(throughline.collect("name"))   # () — back outside, the stack is empty
 
-with snap.restore():
+with throughline.restore(snap):
     print(throughline.collect("name"), throughline.get("request_id"))
     # ('request_handler',) r-42
+```
+
+Because a snapshot is plain data, it is picklable (when its values are) and can
+cross both thread and process boundaries. `restore()` also accepts a raw
+iterable of frame dicts — e.g. `snap.frames()` after a serialization round-trip
+returns a *list* of dicts — and replays already-validated frames, so it bypasses
+the `required`-key check that `__call__` enforces:
+
+```python
+import pickle
+
+payload = pickle.dumps(snap)          # send to another process...
+revived = pickle.loads(payload)       # ...and restore into the same singleton
+with throughline.restore(revived):
+    print(throughline.get("request_id"))   # r-42
+
+# Or restore a serialized frames() payload (a list of dicts) directly:
+with throughline.restore([{"name": "request_handler", "request_id": "r-42"}]):
+    ...
 ```
 
 ### `ThreadTask`
@@ -227,6 +255,20 @@ t = ThreadTask(
 )
 print(t.wait())     # 7
 print(log_lines)    # ['adder finished -> 7']
+```
+
+Pass `start=False` to create the thread without launching it, then call
+`.start()` once you have wired up callbacks. This lets you attach finish/stop
+callbacks (or connect signals) before any work runs, race-free. `.start()` is
+idempotent — a second call, or calling it on a task already started by the
+default `start=True`, is a safe no-op. Context and parent registration are
+still captured at construction time, so a not-yet-started child is stopped if
+its parent stops.
+
+```python
+t = ThreadTask(work, start=False)
+t.add_finish_callback(on_done)   # registered before any work runs
+t.start()
 ```
 
 ### `asynch` and `synch`
@@ -347,6 +389,78 @@ worker.stop()          # already-queued jobs drain, then the thread shuts down
 
 After `stop()`, the worker drains any jobs already queued and then exits;
 further `submit()` calls raise `RuntimeError`.
+
+### `Promise` — an externally-completed task
+
+`ThreadTask` and `WorkTask` are *body-driven*: a callable runs and its return
+value (or exception) finishes the task. But many real results are *externally
+completed* — finished by a producer that already exists (a hardware monitor
+thread, a socket-reply reader, a GUI callback, a lock loop) rather than by a
+body of their own. Wrapping those in a `ThreadTask` would burn a useless parking
+thread per result. A `Promise` is the missing primitive: a `Task` with **no
+thread and no body**, completed externally via `resolve()` / `fail()`, that
+otherwise participates fully in the Task protocol and the stop hierarchy.
+
+```python
+from gentletask import Promise, ThreadTask
+
+# A producer hands out a Promise and finishes it later from wherever it runs.
+target_reached = Promise(name="target-reached")
+
+def monitor():  # some already-running producer
+    ...                            # watch the hardware
+    target_reached.resolve(123)    # complete it from outside — no new thread
+
+ThreadTask(monitor, name="hw-monitor")
+print(target_reached.wait())       # blocks poll-free until resolve() -> 123
+```
+
+`resolve(value)` completes it successfully; `fail(exc)` completes it with an
+exception that `wait()` re-raises. Both are idempotent — the first completion
+wins and later calls are no-ops. A `Promise` created inside a running task
+registers as that task's child, so a parent `stop()` cascades to it; because a
+stopped promise has no body to raise `Stopped`, `stop()` fires its stop
+callbacks (letting the external producer abort its side-effects) and then
+completes the promise with `Stopped` so its waiters never hang. `stop(reason)`
+carries the reason into that injected `Stopped`.
+
+### `MultiTask` — aggregate several running tasks into one
+
+Sometimes you have several tasks already running and want to treat them as a
+single waitable unit: block until they have **all** finished, collect their
+results, surface their errors together, and stop them as a group. `MultiTask` is
+that aggregator. Like `Promise` it is **bodyless and threadless** — it spawns no
+thread, and is driven entirely by its children's finish callbacks.
+
+```python
+from gentletask import MultiTask, ThreadTask
+
+a = ThreadTask(lambda: 1, name="a")
+b = ThreadTask(lambda: 2, name="b")
+c = ThreadTask(lambda: 3, name="c")
+
+both = MultiTask([a, b, c], name="gather")
+print(both.wait())   # blocks until all three finish -> [1, 2, 3] (task order)
+```
+
+`wait()` returns the list of child results **in task order**. Errors aggregate
+by count:
+
+- all children succeed → `wait()` returns the list of results;
+- exactly one child fails → `wait()` re-raises **that** child's exception
+  directly (no wrapping);
+- two or more fail → `wait()` raises `MultiException`, whose `.exceptions` holds
+  the failing children's exceptions in task order and whose message combines
+  them.
+
+`stop(reason)` stops every child and then this task, completing with `Stopped`
+(carrying the reason) so waiters never hang even if a child does not complete on
+stop. A `MultiTask` created inside a running task registers as that task's child,
+so a parent `stop()` cascades through the `MultiTask` to all of its children.
+Because `add_finish_callback` fires immediately for an already-finished child, a
+`MultiTask` constructed over a mix of already-done and still-pending children
+counts them all correctly and only completes once the last pending child
+finishes.
 
 ### Logging integration
 
@@ -505,15 +619,18 @@ to use the stop-aware primitives.
 
 | Name | Description |
 | --- | --- |
-| `Stopped` | Raised inside a task when `stop()` has been requested. Unwinds normally; `finally` blocks run. |
+| `Stopped` | Raised inside a task when `stop()` has been requested. Carries the optional `reason` passed to `stop()` as its message (`str(Stopped("foo")) == "foo"`; a reason-less `Stopped()` is empty). Unwinds normally; `finally` blocks run. |
+| `MultiException(message, exceptions)` | Aggregate raised by `MultiTask.wait()` when more than one child failed. `.exceptions` holds the child exceptions in task order; the message combines `message` with each child's string form. |
 
 ### Tasks
 
 | Name | Description |
 | --- | --- |
 | `Task` | `runtime_checkable` structural `Protocol` for a stoppable, waitable unit of work. |
-| `ThreadTask(fn, args=(), kwargs=None, *, name=None, detach=False, on_finish=None)` | Runs `fn` in a new daemon thread; implements `Task`. |
+| `ThreadTask(fn, args=(), kwargs=None, *, name=None, detach=False, on_finish=None, start=True)` | Runs `fn` in a new daemon thread; implements `Task`. With `start=False`, call `.start()` to launch (idempotent). |
 | `WorkTask(fn, args, kwargs, name=None)` | One job queued to a `WorkerThread`; implements `Task`. Usually created via `WorkerThread.submit`. |
+| `Promise(name=None, *, on_finish=None)` | A `Task` with no thread or body, completed externally via `resolve(value)` / `fail(exc)`; implements `Task`. Idempotent completion; `stop(reason=None)` completes it with `Stopped` carrying the reason. |
+| `MultiTask(tasks, name=None, *, on_finish=None)` | A bodyless, threadless `Task` that completes when ALL its child `tasks` complete; implements `Task`. `wait()` returns the list of child results in task order, re-raises a lone child failure, or raises `MultiException` for two or more. `stop(reason=None)` stops every child then completes with `Stopped`. `tasks` exposes the children. |
 | `WorkerThread(name=None)` | Long-lived worker thread that serializes submitted jobs. `submit(...)` returns a `WorkTask`; `stop()` drains queued jobs and shuts down. |
 | `asynch(fn, name=None, detach=False, on_finish=None)` | Returns a launcher that starts `fn` in a new `ThreadTask` when called. |
 | `synch(fn)` | Returns a synchronous version of `fn` that de-wraps `asynch` and awaits returned tasks, yielding a concrete value. |
@@ -524,9 +641,10 @@ to use the stop-aware primitives.
 | --- | --- |
 | `is_done: bool` | Whether the task has finished. |
 | `is_stopped: bool` | Whether a stop has been requested. |
+| `stop_reason` | Property; the `reason` passed to the first `stop()`, or `None` for a reason-less stop. |
 | `result` | Property; shorthand for `wait()`. |
-| `wait(timeout=None)` | Block until done, re-raising any worker exception. A stop on the calling parent propagates here and raises `Stopped`. |
-| `stop()` | Request cooperative stop; fire stop callbacks once; cascade to children. |
+| `wait(timeout=None)` | Block until done, re-raising any worker exception. A stop on the calling parent propagates here and raises `Stopped` carrying the parent's reason. |
+| `stop(reason=None)` | Request cooperative stop; record `reason` (first stop only); fire stop callbacks once; cascade to children (passing the reason along). |
 | `add_finish_callback(fn)` | Call `fn(result, exception)` when the task finishes (immediately if already finished). |
 | `add_stop_callback(fn)` | Call zero-arg `fn()` once when the task is stopped (immediately if already stopped). |
 | `remove_stop_callback(fn)` | Unregister a stop callback; no-op if absent. |
@@ -542,8 +660,9 @@ to use the stop-aware primitives.
 | `SemanticStack.collect(key)` | Tuple of all values for `key`, outermost-first. |
 | `SemanticStack.walk(fn)` | Apply `fn` to each frame dict, outermost-first; return a tuple of results. |
 | `SemanticStack.frames()` | Full stack as fresh dicts, outermost-first. |
-| `SemanticStack.snapshot()` | Capture current state as a `SemanticSnapshot`. |
-| `SemanticSnapshot.restore()` | Context manager that installs the captured frames for the block. |
+| `SemanticStack.snapshot()` | Capture current state as a pure-data `SemanticSnapshot` (picklable). |
+| `SemanticStack.restore(snapshot_or_frames)` | Context manager that installs a snapshot (or an iterable of frame dicts) onto this stack for the block; replays without `required`-key validation. |
+| `SemanticSnapshot.frames()` | Captured frames as fresh dicts, outermost-first (for serialization). |
 | `throughline` | Module singleton `SemanticStack("throughline", required=("name",))` — the human-readable narrative. |
 | `task_context(task, name)` | Context manager that enters `name` on the throughline and `task` on the private task stack. |
 | `current_task()` | The innermost running `Task`, or `None` outside any task. |
@@ -559,6 +678,9 @@ to use the stop-aware primitives.
 | `poll(fn, *, interval=0.05, timeout=None)` | Sample `fn` until truthy; stop-aware inter-sample wait. Returns `fn`'s truthy value, or the last falsy value on timeout. |
 | `Queue(maxsize=0)` | Drop-in for `queue.Queue`; `get()` raises `Stopped` if the current task is stopped. |
 | `Event()` | Drop-in for `threading.Event`; `wait()` raises `Stopped` if the current task is stopped. |
+
+Every `Stopped` these raise carries the stopped task's `stop_reason` as its
+message, so callers can log *why* the task unwound.
 
 ---
 

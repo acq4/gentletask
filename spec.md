@@ -46,9 +46,10 @@ class SemanticStack:
     def walk(self, fn: Callable[[dict[str, Any]], Any]) -> tuple[Any, ...]: ...
     def frames(self) -> tuple[dict[str, Any], ...]: ...
     def snapshot(self) -> "SemanticSnapshot": ...
+    def restore(self, snapshot_or_frames) -> ContextManager[None]: ...
 
 class SemanticSnapshot:
-    def restore(self) -> ContextManager[None]: ...
+    def frames(self) -> tuple[dict[str, Any], ...]: ...
 ```
 
 ### `__call__(**kwargs)`
@@ -104,12 +105,24 @@ throughline.walk(lambda f: f.get("name", "?"))
 Returns the full stack as a tuple of freshly constructed dicts, outermost
 first.
 
-### `snapshot()` / `SemanticSnapshot.restore()`
+### `snapshot()` / `restore()`
 
-`snapshot()` captures the current stack state. `restore()` is a context manager
-that installs the snapshot for the duration of its block, then resets. The
-semantics of restoring into a thread that already has frames are defined by
-tests, not by fiat.
+`snapshot()` captures the current stack state as a pure-data `SemanticSnapshot`
+— just the frames, with no reference back to the stack. A snapshot is therefore
+picklable when its frame values are picklable, and `SemanticSnapshot.frames()`
+exposes the captured frames as fresh dicts (outermost-first, mirroring
+`SemanticStack.frames()`) for callers that want to serialize them.
+
+`stack.restore(snapshot_or_frames)` is a context manager that installs the given
+frames onto *that stack* for the duration of its block, then resets. It accepts
+either a `SemanticSnapshot` or an iterable of frame dicts (so the output of
+`frames()` — a *list* of dicts after a serialization round-trip, or a tuple —
+can be restored directly). Restoration is a **replay** of already-validated
+frames, so it **bypasses** the `required`-key validation `__call__` enforces:
+the frames may have come from a stack with different required keys, or from
+another process entirely, and are not re-validated. The semantics of restoring
+into a thread that already has frames (they are hidden, not merged) are defined
+by tests, not by fiat.
 
 ---
 
@@ -185,6 +198,13 @@ All values set by the gentletask library will be pickleable, and so long as your
 code adheres to that restriction, the throughline can be copied across process
 boundaries. `teleprox` makes use of this, as an example.
 
+Because a `SemanticSnapshot` is pure data (no stack reference), it can be
+pickled, sent to another process, and restored into that process's same-named
+singleton — `throughline.restore(snapshot)` (or, equivalently, restoring a
+serialized `frames()` payload, a list of dicts, via `throughline.restore(frames)`).
+Restore bypasses required-key validation, so a frames payload built without the
+throughline's required `name` key still replays cleanly.
+
 ---
 
 ## `SemanticStack` outside of tasks
@@ -244,10 +264,22 @@ poll-free.
 Runs a callable in a new daemon thread.
 
 ```python
-task = ThreadTask(fn, args=(), kwargs=None, name=None, detach=False, on_finish=None)
+task = ThreadTask(fn, args=(), kwargs=None, name=None, detach=False, on_finish=None, start=True)
 # Alternately, as a decorator:
 task = asynch(fn, name=None, detach=False, on_finish=None)(*args, **kwargs)
 ```
+
+**Deferred start.** With `start=True` (default) the thread is launched at the
+end of `__init__`. With `start=False` the thread is created but not launched;
+the caller calls `.start()` to begin work. This lets a caller attach
+finish/stop callbacks or connect signals BEFORE any work runs, race-free:
+construct, register callbacks, then `start()`. `.start()` is idempotent — a
+second call (or calling it on a task already auto-started by `start=True`) is a
+safe no-op. Context capture (`copy_context()`) and parent registration both
+still happen at construction time, NOT at `start()`: the task inherits the
+context of the code that *created* it, and registers in the parent's child set
+immediately so a parent stop reaches even a not-yet-started child. `asynch()` is
+a launcher and always starts immediately.
 
 **Context inheritance.** Uses `contextvars.copy_context()` so the thread starts
 with the caller's stack state (both stacks). The task then enters its own frame
@@ -262,14 +294,22 @@ with task_context(self, self.name):  # name -> throughline, self -> task stack
 all registered children. When a task finishes — normally or by exception — it
 stops any still-running children unless they were explicitly detached.
 
+**`stop(reason=None)`.** Requests a cooperative stop. The optional `reason` is a
+diagnostic string recorded by the *first* stop only (a later `stop()` is a no-op
+and does not overwrite it), exposed via the `stop_reason` property. The reason
+cascades to children (`child.stop(reason)`) and is carried into the `Stopped`
+that the stop-aware primitives raise, so logs can record why work was stopped. A
+reason-less `stop()` yields a message-less `Stopped()`, exactly as before.
+
 **`detach()`.** Removes this task from its parent's stop propagation. A
 subsequent `parent.stop()` will not cascade here.
 
 **`wait(timeout=None)`.** Blocks until the task is done, parked on a per-task
 `Condition` rather than a poll loop — `_finish()` notifies it directly. If
 called from inside another task, `wait` registers a stop callback on that parent
-so a `parent.stop()` wakes the wait immediately; it then calls `self.stop()` and
-raises `Stopped`.
+so a `parent.stop()` wakes the wait immediately; it then calls
+`self.stop(parent.stop_reason)` and raises `Stopped` carrying the parent's
+reason.
 
 **`__del__` cleanup.** A `ThreadTask` garbage-collected before `wait()` is
 called automatically calls `stop()` on itself and its children.
@@ -318,7 +358,7 @@ picks up the job it restores both snapshots, then enters its own frame on each
 via `task_context`:
 
 ```python
-with throughline_snapshot.restore(), task_snapshot.restore():
+with throughline.restore(throughline_snapshot), _task_stack.restore(task_snapshot):
     with task_context(self, self.name):
         fn(*args, **kwargs)
 ```
@@ -330,6 +370,120 @@ single task.
 
 **`wait(timeout=None)`.** Same poll-free wake-on-done / wake-on-parent-stop
 semantics as `ThreadTask`.
+
+---
+
+## `Promise`
+
+A `Task` with **no thread and no body**, completed *externally*. `ThreadTask`
+and `WorkTask` are body-driven — a callable runs and its return value (or
+exception) finishes the task. A `Promise` instead represents a result that some
+already-existing producer will finish: a hardware monitor thread, a socket-reply
+reader, a GUI callback, a lock loop. Wrapping those in a `ThreadTask` would mean
+a useless parking thread per result; a `Promise` is just the shared completion
+state. It otherwise participates fully in the Task protocol and the stop
+hierarchy.
+
+```python
+class Promise(_TaskCore):
+    def __init__(self, name: str | None = None, *, on_finish=None): ...
+    def resolve(self, value: Any = None) -> None: ...   # complete successfully
+    def fail(self, exc: BaseException) -> None: ...      # complete with exception
+    def stop(self, reason: str | None = None) -> None: ...  # complete with Stopped
+```
+
+**Construction.** Registers with the creating task (`_register_with_parent`) so
+a parent `stop()` cascades here. Spawns **no thread**. `fn` is unused, so the
+name falls back to `"Promise"`.
+
+**`resolve(value)` / `fail(exc)`.** Complete the promise via `_finish`, waking
+waiters poll-free and firing finish callbacks with `(value, None)` or
+`(None, exc)`. Both are **idempotent**: the first completion (resolve, fail, or
+stop) wins; later calls are no-ops.
+
+**`stop(reason=None)`.** A stopped promise has no body to raise `Stopped`, so it
+must complete itself or its waiters hang. `stop()` first calls
+`super().stop(reason)` — recording the reason, setting `is_stopped`, firing stop
+callbacks (so the external producer can abort its side-effects), and cascading to
+children — then, if the promise is still incomplete (a stop callback may have
+already resolved/failed it), completes it with `Stopped` carrying that reason.
+Idempotent.
+
+**`wait(timeout=None)`.** Inherited: returns the resolved value, re-raises a
+failed exception, or raises `Stopped` for a stopped promise, with the same
+poll-free wake-on-done / wake-on-parent-stop semantics as `ThreadTask`.
+
+---
+
+## `MultiTask`
+
+A bodyless, threadless `Task` that aggregates several already-running tasks into
+one waitable unit and completes when **all** of its children complete. Like
+`Promise` it spawns no thread and has no body; it is driven entirely by its
+children's finish callbacks. Use it to wait for a group of tasks together,
+collect their results in order, surface their combined errors, and stop them as
+a unit. It participates fully in the Task protocol and the stop hierarchy.
+
+```python
+class MultiException(Exception):
+    def __init__(self, message: str, exceptions): ...   # .exceptions = list(exceptions)
+
+class MultiTask(_TaskCore):
+    def __init__(self, tasks, name: str | None = None, *, on_finish=None): ...
+    @property
+    def tasks(self) -> tuple[Task, ...]: ...            # the children, in order
+    def stop(self, reason: str | None = None) -> None: ...  # stop all children, then complete
+```
+
+**Construction.** Stores the children, registers with the creating task
+(`_register_with_parent`) so a parent `stop()` cascades through here to the
+children, and spawns **no thread**. `fn` is unused, so the name falls back to
+`"MultiTask"`. Pre-sizes per-child result/exception slots and a `remaining`
+counter initialized to the child count, then registers a per-index finish
+callback on each child via `functools.partial(self._child_finished, i)`.
+
+**Construction-time already-done race.** `add_finish_callback` fires
+**immediately** when the child is already finished, so a child may call
+`_child_finished` *during* the registration loop — before the other callbacks
+are registered. Initializing `remaining` to the full child count up front and
+decrementing once per callback makes the "all done" check (`remaining == 0`)
+correct regardless of when each callback fires, including the all-already-done
+case where every callback fires synchronously inside the loop. A zero-child
+`MultiTask` completes immediately with an empty result list.
+
+**`_child_finished(index, result, exc)`.** Under the lock, records the child's
+`result`/`exc`, decrements `remaining`, and — only when it reaches zero and the
+task is not already done — snapshots the results/exceptions. The completion
+decision and `_finish` happen **outside the lock** (a finish callback may take
+other locks; matching `_TaskCore` conventions), guarded by `is_done` so a
+concurrent `stop()` that already completed the task wins. Completion rule:
+
+- no child exceptions → `_finish(result=list(child_results))`;
+- exactly one exception → `_finish(exc=that_exception)` (re-raised directly,
+  unwrapped);
+- two or more → `_finish(exc=MultiException("Multiple tasks failed", exceptions))`.
+
+If a stop is propagating when the last child finishes — either this task was
+stopped directly, or a grandparent stop reached the children first (a parent's
+child set is unordered) — it completes with a single `Stopped` rather than
+aggregating the children's `Stopped`s into a `MultiException`.
+
+**`stop(reason=None)`.** Sets this task's own stop flag first via
+`super().stop(reason)` (recording the reason, firing stop callbacks), then stops
+every child. Setting the flag before cascading lets `_child_finished` see
+`is_stopped` and report a single `Stopped` rather than a `MultiException` of the
+children's `Stopped`s. Finally, if still incomplete (a child that does not
+complete on stop), it self-completes with `Stopped` carrying the reason so
+waiters never hang. Idempotent via `super().stop()`'s guard.
+
+**`wait(timeout=None)`.** Inherited: returns the list of child results in task
+order, re-raises the lone child exception or the aggregated `MultiException`, or
+raises `Stopped` for a stopped `MultiTask`.
+
+**`MultiException`.** Carries `.exceptions` (the failing children's exceptions,
+in task order) and builds a combined message from *message* plus each child's
+string form. Raised only when two or more children fail — a single failure
+re-raises that child's own exception unwrapped.
 
 ---
 
@@ -385,8 +539,12 @@ task there is nothing to stop, so they behave like their stdlib equivalents.
 
 ## Supporting primitives
 
-**`Stopped`.** Exception raised when a task's stop has been requested. Unwind
-normally; finally blocks run.
+**`Stopped`.** Exception raised when a task's stop has been requested. Carries
+the optional `reason` passed to `stop()` as its message, so `str(Stopped("foo"))
+== "foo"` and a reason-less `Stopped()` is empty. Every site that raises it for a
+stopped current task — `check_stop`, `sleep`, `Queue.get`, `Event.wait`, `poll`
+(via `check_stop`), and `Task.wait`'s parent-cascade — supplies that task's
+`stop_reason`. Unwind normally; finally blocks run.
 
 **`sleep(seconds)`.** Drop-in for `time.sleep`. Blocks on the stop signal
 itself, so a stop unblocks it immediately (raising `Stopped`); otherwise it

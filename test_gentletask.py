@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import pickle
 import threading
 import time
 
@@ -13,7 +14,11 @@ import pytest
 
 from gentletask import (
     Event,
+    MultiException,
+    MultiTask,
+    Promise,
     Queue,
+    SemanticSnapshot,
     SemanticStack,
     Stopped,
     Task,
@@ -32,7 +37,6 @@ from gentletask import (
     throughline,
 )
 from gentletask import _task_stack
-
 
 # ---------------------------------------------------------------------------
 # SemanticStack
@@ -193,7 +197,7 @@ class TestSemanticSnapshot:
         # Outside the original frame the stack is empty again...
         assert s.collect("name") == ()
         # ...but restore brings the captured frames back.
-        with snap.restore():
+        with s.restore(snap):
             assert s.collect("name") == ("captured",)
         assert s.collect("name") == ()
 
@@ -205,7 +209,7 @@ class TestSemanticSnapshot:
             snap = s.snapshot()
         with s(name="live"):
             assert s.collect("name") == ("live",)
-            with snap.restore():
+            with s.restore(snap):
                 assert s.collect("name") == ("captured",)
             # Live frame comes back after the snapshot block ends.
             assert s.collect("name") == ("live",)
@@ -214,10 +218,69 @@ class TestSemanticSnapshot:
         s = SemanticStack()
         with s(name="base"):
             snap = s.snapshot()
-        with snap.restore():
+        with s.restore(snap):
             with s(name="added"):
                 assert s.collect("name") == ("base", "added")
             assert s.collect("name") == ("base",)
+
+    def test_snapshot_holds_no_stack_reference(self):
+        # A snapshot is pure data: it does not retain its originating stack.
+        s = SemanticStack()
+        with s(name="captured", request_id="r-1"):
+            snap = s.snapshot()
+        assert not hasattr(snap, "_stack")
+
+    def test_snapshot_frames_returns_dicts_outermost_first(self):
+        s = SemanticStack()
+        with s(name="outer"):
+            with s(name="inner", extra=1):
+                snap = s.snapshot()
+        assert snap.frames() == ({"name": "outer"}, {"name": "inner", "extra": 1})
+
+    def test_snapshot_is_picklable_and_restores(self):
+        s = SemanticStack()
+        with s(name="captured", request_id="r-42"):
+            snap = s.snapshot()
+        revived = pickle.loads(pickle.dumps(snap))
+        with s.restore(revived):
+            assert s.collect("name") == ("captured",)
+            assert s.get("request_id") == "r-42"
+        assert s.collect("name") == ()
+
+    def test_restore_accepts_list_of_dicts(self):
+        # Simulate a serialized payload arriving as a *list* of dicts
+        # (what frames() looks like after a msgpack/JSON round-trip).
+        s = SemanticStack()
+        payload = [{"name": "outer"}, {"name": "inner", "extra": 1}]
+        with s.restore(payload):
+            assert s.collect("name") == ("outer", "inner")
+            assert s.get("extra") == 1
+        assert s.collect("name") == ()
+
+    def test_restore_accepts_tuple_of_dicts(self):
+        s = SemanticStack()
+        payload = ({"name": "outer"}, {"name": "inner"})
+        with s.restore(payload):
+            assert s.collect("name") == ("outer", "inner")
+
+    def test_restore_bypasses_required_key_validation(self):
+        # Frames captured from a stack with no required keys can be replayed
+        # into a stack that *does* require keys — restore is a replay, not a
+        # fresh frame, so validation is skipped.
+        plain = SemanticStack("plain")
+        with plain(other="x"):  # no "name" key at all
+            snap = plain.snapshot()
+        required = SemanticStack("required", required=("name",))
+        # No ValueError despite the missing required "name" key.
+        with required.restore(snap):
+            assert required.get("other") == "x"
+
+    def test_restore_into_throughline_singleton_bypasses_required(self):
+        # A frames payload produced elsewhere (e.g. another process) without a
+        # "name" key can still be restored into the throughline singleton.
+        payload = [{"request_id": "r-1"}]
+        with throughline.restore(payload):
+            assert throughline.get("request_id") == "r-1"
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +421,20 @@ class TestPollFreeWake:
             t.wait(timeout=1.0)
         assert time.monotonic() - start < 0.5
 
+    def test_infinite_sleep_waits_until_stopped(self):
+        # sleep(inf) means "wait until stopped" — it must not overflow
+        # (Event.wait cannot take a non-finite timeout) and must wake on stop.
+        def fn():
+            sleep(float("inf"))
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        start = time.monotonic()
+        t.stop()
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+        assert time.monotonic() - start < 0.5
+
     def test_queue_get_wakes_on_stop_with_no_timeout(self):
         q = Queue()
 
@@ -455,6 +532,100 @@ class TestThreadTask:
         barrier.wait()
         t.wait(timeout=1.0)
         assert t.is_stopped
+
+
+# ---------------------------------------------------------------------------
+# ThreadTask — deferred start
+# ---------------------------------------------------------------------------
+
+
+class TestThreadTaskDeferredStart:
+    def test_default_starts_immediately(self):
+        t = ThreadTask(lambda: 42)
+        assert t.wait() == 42
+
+    def test_start_false_does_not_run_body_until_start(self):
+        ran = threading.Event()
+
+        def fn():
+            ran.set()
+
+        t = ThreadTask(fn, start=False)
+        # Body must not run before .start().
+        assert not ran.wait(0.1)
+        assert not t.is_done
+        t.start()
+        assert ran.wait(1.0)
+        t.wait(timeout=1.0)
+        assert t.is_done
+
+    def test_callback_registered_before_start_fires_with_no_race(self):
+        # The whole point of deferred start: attach a finish callback before
+        # any work runs, race-free.
+        results = []
+
+        def fn():
+            return 7
+
+        t = ThreadTask(fn, start=False)
+        t.add_finish_callback(lambda r, e: results.append((r, e)))
+        t.start()
+        t.wait(timeout=1.0)
+        assert results == [(7, None)]
+
+    def test_stop_callback_registered_before_start_fires(self):
+        fired = []
+
+        def fn():
+            sleep(10)
+
+        t = ThreadTask(fn, start=False)
+        t.add_stop_callback(lambda: fired.append(True))
+        t.start()
+        t.stop()
+        assert fired == [True]
+
+    def test_unstarted_child_is_stopped_when_parent_stops(self):
+        # A child constructed (and registered) but not yet started must still
+        # receive a stop when its parent stops.
+        child_holder = {}
+        parent_proceed = threading.Event()
+
+        def parent_fn():
+            child = ThreadTask(lambda: sleep(10), name="child", start=False)
+            child_holder["child"] = child
+            parent_proceed.set()
+            sleep(10)
+
+        parent = ThreadTask(parent_fn, name="parent")
+        assert parent_proceed.wait(1.0)
+        child = child_holder["child"]
+        parent.stop()
+        # The not-yet-started child received the stop cascade.
+        assert child.is_stopped
+
+    def test_double_start_is_noop(self):
+        ran = []
+        t = ThreadTask(lambda: ran.append(1), start=False)
+        t.start()
+        t.start()  # second start is a safe no-op
+        t.wait(timeout=1.0)
+        assert ran == [1]
+
+    def test_start_after_auto_started_is_noop(self):
+        t = ThreadTask(lambda: 99)
+        t.wait(timeout=1.0)
+        # start=True already launched it; calling start() again is a no-op.
+        t.start()
+        assert t.wait() == 99
+
+    def test_wait_on_unstarted_times_out(self):
+        t = ThreadTask(lambda: 1, start=False)
+        # Not started, so it never completes; wait should time out -> None.
+        assert t.wait(timeout=0.1) is None
+        assert not t.is_done
+        t.start()
+        assert t.wait(timeout=1.0) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +782,24 @@ class TestSynch:
         seen = []
         synch(asynch(lambda: seen.append(current_task())))()
         assert seen == [None]
+
+    def test_synch_of_bound_asynch_method_keeps_self_and_runs_inline(self):
+        # synch on a BOUND method of an asynch-wrapped function must re-apply the
+        # binding (not call the unbound original and drop self), and run inline.
+        threads = []
+
+        class Mover:
+            base = 10
+
+            @asynch
+            def go(self, x):
+                threads.append(threading.current_thread())
+                return self.base + x
+
+        m = Mover()
+        result = synch(m.go)(5)
+        assert result == 15
+        assert threads == [threading.current_thread()]
 
     def test_waits_for_returned_thread_task(self):
         # A plain function that returns a ThreadTask: synch waits for it.
@@ -840,6 +1029,16 @@ class TestThroughlineNameFilter:
         record = logging.LogRecord("test", logging.INFO, "", 0, "msg", (), None)
         f.filter(record)
         assert record.throughline == ()
+
+    def test_does_not_overwrite_existing_throughline(self):
+        # A record tagged by its originating process must survive re-handling
+        # elsewhere (e.g. a log server) under an unrelated current throughline.
+        f = ThroughlineNameFilter()
+        record = logging.LogRecord("test", logging.INFO, "", 0, "msg", (), None)
+        record.throughline = ("from_child",)
+        with throughline(name="server_side"):
+            f.filter(record)
+        assert record.throughline == ("from_child",)
 
 
 # ---------------------------------------------------------------------------
@@ -1400,3 +1599,596 @@ class TestCallbackErrorsLogged:
             with pytest.raises(Stopped):
                 t.wait(timeout=1.0)
         assert "stop callback raised" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Promise — externally-completed Task with no thread/body
+# ---------------------------------------------------------------------------
+
+
+class TestPromise:
+    def test_is_task(self):
+        assert isinstance(Promise(), Task)
+
+    def test_resolve_makes_wait_return_value(self):
+        p = Promise()
+        p.resolve(42)
+        assert p.wait() == 42
+        assert p.result == 42
+        assert p.is_done
+
+    def test_resolve_spawns_no_thread(self):
+        before = threading.active_count()
+        p = Promise(name="no-thread")
+        p.resolve(1)
+        p.wait()
+        # No parking thread was ever created for the promise.
+        assert threading.active_count() == before
+        assert not any(t.name == "no-thread" for t in threading.enumerate())
+
+    def test_resolve_default_value_is_none(self):
+        p = Promise()
+        p.resolve()
+        assert p.wait() is None
+
+    def test_fail_reraises_through_wait(self):
+        p = Promise()
+        boom = ValueError("boom")
+        p.fail(boom)
+        with pytest.raises(ValueError, match="boom"):
+            p.wait()
+        assert p.is_done
+
+    def test_stop_before_completion_raises_stopped(self):
+        p = Promise()
+        fired = []
+        p.add_stop_callback(lambda: fired.append(True))
+        p.stop()
+        assert p.is_stopped
+        assert p.is_done
+        assert fired == [True]
+        with pytest.raises(Stopped):
+            p.wait()
+        # A late resolve is a no-op: it stays Stopped.
+        p.resolve(99)
+        with pytest.raises(Stopped):
+            p.wait()
+
+    def test_resolve_is_idempotent(self):
+        p = Promise()
+        p.resolve(1)
+        p.resolve(2)  # ignored
+        assert p.wait() == 1
+
+    def test_resolve_after_fail_ignored(self):
+        p = Promise()
+        p.fail(RuntimeError("nope"))
+        p.resolve(7)  # ignored
+        with pytest.raises(RuntimeError, match="nope"):
+            p.wait()
+
+    def test_fail_after_resolve_ignored(self):
+        p = Promise()
+        p.resolve(3)
+        p.fail(RuntimeError("nope"))  # ignored
+        assert p.wait() == 3
+
+    def test_on_finish_fires_with_value_on_resolve(self):
+        seen = []
+        p = Promise(on_finish=lambda v, e: seen.append((v, e)))
+        p.resolve(5)
+        assert seen == [(5, None)]
+
+    def test_add_finish_callback_fires_on_fail(self):
+        seen = []
+        p = Promise()
+        exc = ValueError("x")
+        p.add_finish_callback(lambda v, e: seen.append((v, e)))
+        p.fail(exc)
+        assert seen == [(None, exc)]
+
+    def test_add_finish_callback_fires_immediately_if_done(self):
+        p = Promise()
+        p.resolve(11)
+        seen = []
+        p.add_finish_callback(lambda v, e: seen.append((v, e)))
+        assert seen == [(11, None)]
+
+    def test_parent_stop_cascades_to_promise(self):
+        # A Promise created inside a running ThreadTask is stopped when the
+        # parent stops, and the parent's wait() on it unblocks with Stopped.
+        captured = {}
+
+        def parent_fn():
+            p = Promise(name="child-promise")
+            captured["promise"] = p
+            p.wait()  # never resolved; only the parent stop frees it
+
+        parent = ThreadTask(parent_fn)
+        # Wait for the promise to be created inside the parent.
+        deadline = time.monotonic() + 1.0
+        while "promise" not in captured and time.monotonic() < deadline:
+            time.sleep(0.005)
+        parent.stop()
+        with pytest.raises(Stopped):
+            parent.wait(timeout=1.0)
+        assert captured["promise"].is_stopped
+        assert captured["promise"].is_done
+
+    def test_consumer_in_sibling_task_gets_value(self):
+        p = Promise(name="shared")
+
+        def consumer():
+            return p.wait()
+
+        sibling = ThreadTask(consumer)
+        time.sleep(0.05)  # sibling is now parked in p.wait()
+        p.resolve("hello")
+        assert sibling.wait(timeout=1.0) == "hello"
+
+    def test_stop_callback_resolution_wins_over_injected_stopped(self):
+        # A stop callback may legitimately complete the promise; that completion
+        # must win over the Stopped that stop() would otherwise inject.
+        p = Promise()
+        p.add_stop_callback(lambda: p.resolve("rescued"))
+        p.stop()
+        assert p.wait(timeout=1.0) == "rescued"
+        assert p.is_done
+
+    def test_concurrent_completers_have_single_consistent_outcome(self):
+        # The first completion wins: concurrent resolve()/fail() must not
+        # split-brain, i.e. the finish callback's view and wait()'s view always
+        # agree on the same single outcome. With a non-atomic _finish the loser's
+        # result could overwrite the winner's between the two views.
+        boom = RuntimeError("boom")
+        for _ in range(200):
+            p = Promise()
+            seen: list = []
+            p.add_finish_callback(lambda v, e: seen.append((v, e)))
+            barrier = threading.Barrier(2)
+
+            def do_resolve():
+                barrier.wait()
+                p.resolve("ok")
+
+            def do_fail():
+                barrier.wait()
+                p.fail(boom)
+
+            t1 = threading.Thread(target=do_resolve)
+            t2 = threading.Thread(target=do_fail)
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
+
+            assert len(seen) == 1
+            cb_value, cb_exc = seen[0]
+            if cb_exc is None:
+                assert p.wait(timeout=1.0) == cb_value
+            else:
+                with pytest.raises(BaseException) as info:
+                    p.wait(timeout=1.0)
+                assert info.value is cb_exc
+
+    def test_consumer_resolved_before_sibling_stop_keeps_value(self):
+        # If the producer resolves the promise before a consuming sibling is
+        # stopped, the value stands — stopping the now-finished sibling cannot
+        # retroactively corrupt the already-completed promise.
+        p = Promise(name="shared2")
+
+        def consumer():
+            return p.wait()
+
+        sibling = ThreadTask(consumer)
+        time.sleep(0.05)
+        p.resolve("locked-in")
+        assert sibling.wait(timeout=1.0) == "locked-in"
+        sibling.stop()  # late stop on a finished task cascades to the promise
+        # The already-resolved value stands; stop cannot overwrite a finished
+        # promise's result (Promise.stop only injects Stopped if not yet done).
+        assert p.wait() == "locked-in"
+
+    def test_stopping_consuming_sibling_cascades_to_promise(self):
+        # A promise waited on from inside a task joins that task's stop cascade
+        # (the inherited Task wait() contract): stopping the consumer stops the
+        # promise too, cleanly, with no hung waiter. This is propagation, not
+        # corruption — the promise ends up consistently stopped+done.
+        p = Promise(name="shared3")
+
+        def consumer():
+            p.wait()
+
+        sibling = ThreadTask(consumer)
+        time.sleep(0.05)
+        sibling.stop()
+        with pytest.raises(Stopped):
+            sibling.wait(timeout=1.0)
+        assert p.is_stopped
+        assert p.is_done
+        with pytest.raises(Stopped):
+            p.wait(timeout=1.0)
+
+    def test_default_name(self):
+        p = Promise()
+        assert "Promise" in repr(p) or p._name == "Promise"
+
+
+# ---------------------------------------------------------------------------
+# Stop reasons
+# ---------------------------------------------------------------------------
+
+
+class TestStopReason:
+    def test_sleep_stopped_carries_reason(self):
+        captured = []
+
+        def fn():
+            try:
+                sleep(30)
+            except Stopped as exc:
+                captured.append(str(exc))
+                raise
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        t.stop(reason="user cancelled")
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "user cancelled"
+        assert captured == ["user cancelled"]
+
+    def test_check_stop_carries_reason(self):
+        barrier = threading.Event()
+
+        def fn():
+            barrier.set()
+            while True:
+                check_stop()
+                time.sleep(0.005)
+
+        t = ThreadTask(fn)
+        barrier.wait(timeout=1.0)
+        t.stop(reason="check-stop reason")
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "check-stop reason"
+
+    def test_poll_carries_reason(self):
+        barrier = threading.Event()
+
+        def fn():
+            barrier.set()
+            poll(lambda: False)
+
+        t = ThreadTask(fn)
+        barrier.wait(timeout=1.0)
+        t.stop(reason="poll reason")
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "poll reason"
+
+    def test_queue_get_carries_reason(self):
+        q = Queue()
+
+        def fn():
+            q.get()
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        t.stop(reason="queue reason")
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "queue reason"
+
+    def test_event_wait_carries_reason(self):
+        e = Event()
+
+        def fn():
+            e.wait()
+
+        t = ThreadTask(fn)
+        time.sleep(0.05)
+        t.stop(reason="event reason")
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "event reason"
+
+    def test_promise_stop_reason_reaches_waiter(self):
+        p = Promise(name="promised")
+        p.stop(reason="why")
+        with pytest.raises(Stopped) as info:
+            p.wait(timeout=1.0)
+        assert str(info.value) == "why"
+
+    def test_parent_stop_reason_cascades_to_child(self):
+        def child_fn():
+            sleep(30)
+
+        def parent_fn():
+            child = ThreadTask(child_fn)
+            child.wait()
+
+        parent = ThreadTask(parent_fn)
+        time.sleep(0.05)
+        parent.stop(reason="parent says stop")
+        with pytest.raises(Stopped) as info:
+            parent.wait(timeout=1.0)
+        assert str(info.value) == "parent says stop"
+
+    def test_idempotent_stop_keeps_first_reason(self):
+        t = ThreadTask(lambda: sleep(30))
+        time.sleep(0.05)
+        t.stop(reason="first")
+        t.stop(reason="second")
+        assert t.stop_reason == "first"
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "first"
+
+    def test_stop_without_reason_is_reasonless(self):
+        t = ThreadTask(lambda: sleep(30))
+        time.sleep(0.05)
+        t.stop()
+        assert t.stop_reason is None
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == ""
+
+    def test_stop_reason_accessor_returns_stored_reason(self):
+        t = ThreadTask(lambda: sleep(30))
+        time.sleep(0.05)
+        t.stop(reason="diagnostic")
+        assert t.stop_reason == "diagnostic"
+        with pytest.raises(Stopped):
+            t.wait(timeout=1.0)
+
+    def test_stop_before_run_carries_reason(self):
+        barrier = threading.Event()
+        t = ThreadTask(lambda: barrier.wait(1.0), start=False)
+        t.stop(reason="never started")
+        t.start()
+        with pytest.raises(Stopped) as info:
+            t.wait(timeout=1.0)
+        assert str(info.value) == "never started"
+
+    def test_child_spawned_after_parent_stop_carries_reason(self):
+        # A child registered AFTER the parent's stop cascade has already run is
+        # only stopped by the parent's cleanup (_stop_running_children), which
+        # must still forward the recorded reason rather than stop reasonlessly.
+        captured = {}
+        proceed = threading.Event()
+
+        def parent_fn():
+            proceed.wait(2.0)  # park (poll-free) until the parent is stopped
+            child = ThreadTask(lambda: sleep(30), name="late-child")
+            captured["child"] = child
+            # Body returns; the finally clause stops the still-running child.
+
+        parent = ThreadTask(parent_fn)
+        time.sleep(0.05)
+        parent.stop(reason="parent halt")
+        proceed.set()  # let the body spawn the late child and return
+        parent.wait(timeout=1.0)
+        child = captured["child"]
+        with pytest.raises(Stopped) as info:
+            child.wait(timeout=1.0)
+        assert str(info.value) == "parent halt"
+
+
+# ---------------------------------------------------------------------------
+# MultiTask
+# ---------------------------------------------------------------------------
+
+
+class TestMultiTask:
+    def test_is_task(self):
+        assert isinstance(MultiTask([]), Task)
+
+    def test_all_success_returns_results_in_order(self):
+        a = Promise()
+        b = Promise()
+        c = Promise()
+        m = MultiTask([a, b, c])
+        b.resolve("b")
+        a.resolve("a")
+        c.resolve("c")
+        assert m.wait(timeout=1.0) == ["a", "b", "c"]
+        assert m.is_done
+
+    def test_empty_completes_with_empty_list(self):
+        m = MultiTask([])
+        assert m.wait(timeout=1.0) == []
+
+    def test_one_child_fails_reraises_that_exception(self):
+        a = Promise()
+        b = Promise()
+        m = MultiTask([a, b])
+        boom = ValueError("boom")
+        a.resolve("ok")
+        b.fail(boom)
+        with pytest.raises(ValueError, match="boom") as info:
+            m.wait(timeout=1.0)
+        assert info.value is boom
+
+    def test_two_failures_raise_multi_exception(self):
+        a = Promise()
+        b = Promise()
+        c = Promise()
+        m = MultiTask([a, b, c])
+        e1 = ValueError("one")
+        e2 = RuntimeError("two")
+        a.fail(e1)
+        b.resolve("ok")
+        c.fail(e2)
+        with pytest.raises(MultiException) as info:
+            m.wait(timeout=1.0)
+        assert info.value.exceptions == [e1, e2]
+        # The combined message names the children's errors.
+        assert "one" in str(info.value)
+        assert "two" in str(info.value)
+
+    def test_stop_stops_all_children_and_completes(self):
+        a = Promise()
+        b = Promise()
+        m = MultiTask([a, b])
+        m.stop()
+        assert a.is_stopped
+        assert b.is_stopped
+        assert m.is_done
+        with pytest.raises(Stopped):
+            m.wait(timeout=1.0)
+
+    def test_child_already_done_before_construction_counted(self):
+        done = Promise()
+        done.resolve("early")
+        pending = Promise()
+        m = MultiTask([done, pending])
+        # The already-finished child must not, on its own, complete the
+        # MultiTask: the pending child still has to finish.
+        assert not m.is_done
+        pending.resolve("late")
+        assert m.wait(timeout=1.0) == ["early", "late"]
+
+    def test_all_children_already_done_before_construction(self):
+        a = Promise()
+        a.resolve(1)
+        b = Promise()
+        b.resolve(2)
+        m = MultiTask([a, b])
+        assert m.is_done
+        assert m.wait(timeout=1.0) == [1, 2]
+
+    def test_spawns_no_thread(self):
+        before = threading.active_count()
+        a = Promise()
+        b = Promise()
+        m = MultiTask([a, b], name="no-thread-multi")
+        a.resolve(1)
+        b.resolve(2)
+        m.wait(timeout=1.0)
+        assert threading.active_count() == before
+        assert not any(t.name == "no-thread-multi" for t in threading.enumerate())
+
+    def test_parent_stop_cascades_to_multitask(self):
+        captured = {}
+
+        def parent_fn():
+            a = Promise(name="child-a")
+            b = Promise(name="child-b")
+            m = MultiTask([a, b], name="child-multi")
+            captured["multi"] = m
+            captured["a"] = a
+            captured["b"] = b
+            m.wait()  # never completed except via the parent stop cascade
+
+        parent = ThreadTask(parent_fn)
+        deadline = time.monotonic() + 1.0
+        while "multi" not in captured and time.monotonic() < deadline:
+            time.sleep(0.005)
+        parent.stop()
+        with pytest.raises(Stopped):
+            parent.wait(timeout=1.0)
+        assert captured["multi"].is_stopped
+        assert captured["multi"].is_done
+        assert captured["a"].is_stopped
+        assert captured["b"].is_stopped
+
+    def test_finish_callback_fires_with_results_on_success(self):
+        a = Promise()
+        b = Promise()
+        seen = []
+        m = MultiTask([a, b], on_finish=lambda v, e: seen.append((v, e)))
+        a.resolve("x")
+        b.resolve("y")
+        assert seen == [(["x", "y"], None)]
+
+    def test_add_finish_callback_fires_immediately_if_done(self):
+        a = Promise()
+        a.resolve(1)
+        b = Promise()
+        b.resolve(2)
+        m = MultiTask([a, b])
+        seen = []
+        m.add_finish_callback(lambda v, e: seen.append((v, e)))
+        assert seen == [([1, 2], None)]
+
+    def test_tasks_accessor_returns_children(self):
+        a = Promise()
+        b = Promise()
+        m = MultiTask([a, b])
+        assert list(m.tasks) == [a, b]
+
+    def test_default_name(self):
+        m = MultiTask([])
+        assert "MultiTask" in repr(m) or m._name == "MultiTask"
+
+    def test_multi_exception_holds_exceptions(self):
+        e1 = ValueError("a")
+        e2 = RuntimeError("b")
+        me = MultiException("several failed", [e1, e2])
+        assert me.exceptions == [e1, e2]
+        assert "several failed" in str(me)
+        assert "a" in str(me)
+        assert "b" in str(me)
+
+    def test_stop_reason_cascades_to_children_and_waiter(self):
+        a = Promise()
+        b = Promise()
+        m = MultiTask([a, b])
+        m.stop(reason="halt")
+        for child in (a, b):
+            with pytest.raises(Stopped) as info:
+                child.wait(timeout=1.0)
+            assert str(info.value) == "halt"
+        with pytest.raises(Stopped) as info:
+            m.wait(timeout=1.0)
+        assert str(info.value) == "halt"
+
+    def test_recovers_child_stop_reason_when_not_self_stopped(self):
+        # Children stopped directly (a grandparent stop reaching them before us)
+        # finish with Stopped while this MultiTask's own reason is still unset.
+        # The single Stopped we report must recover the reason from a child
+        # rather than degrade to a reason-less Stopped.
+        a = Promise()
+        b = Promise()
+        m = MultiTask([a, b])
+        a.stop(reason="child reason")
+        b.stop(reason="child reason")
+        assert not m.is_stopped
+        with pytest.raises(Stopped) as info:
+            m.wait(timeout=1.0)
+        assert str(info.value) == "child reason"
+
+    def test_stop_tolerates_child_whose_stop_takes_no_reason(self):
+        # A custom child whose stop() predates the reason parameter still
+        # satisfies the protocol; stopping the MultiTask (which forwards a
+        # reason) must not raise TypeError on it.
+        class NoReasonStopTask:
+            """A pending Task-ish child whose stop() takes no reason argument."""
+
+            def __init__(self):
+                self.is_done = False
+                self.is_stopped = False
+                self._cbs: list = []
+
+            def add_finish_callback(self, fn):
+                if self.is_done:
+                    fn(None, Stopped())
+                else:
+                    self._cbs.append(fn)
+
+            def stop(self):  # no reason parameter, on purpose
+                self.is_stopped = True
+                self.is_done = True
+                cbs, self._cbs = self._cbs, []
+                for cb in cbs:
+                    cb(None, Stopped())
+
+        child = NoReasonStopTask()
+        m = MultiTask([child])
+        m.stop(reason="because")  # must not raise TypeError on the child
+        assert child.is_stopped
+        with pytest.raises(Stopped) as info:
+            m.wait(timeout=1.0)
+        assert str(info.value) == "because"

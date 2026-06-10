@@ -7,6 +7,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import contextvars
+import functools
 import logging
 import queue as _queue
 import threading
@@ -27,8 +28,60 @@ _logger = logging.getLogger(__name__)
 class Stopped(Exception):
     """Raised inside a task when stop() has been requested.
 
+    Carries the optional *reason* passed to ``stop()`` as its message, so
+    ``str(Stopped("foo")) == "foo"`` and a reason-less ``Stopped()`` is empty.
     Unwinds normally; finally blocks run.
     """
+
+
+def _stopped(reason: str | None) -> Stopped:
+    """Build a ``Stopped`` carrying *reason* as its message, or empty if None.
+
+    A reason-less stop must produce a message-less ``Stopped`` (``str(...) ==
+    ""``) exactly as before, so a None reason is dropped rather than stringified
+    to the literal ``"None"``.
+    """
+    return Stopped(reason) if reason is not None else Stopped()
+
+
+def _task_stop_reason(task: "Task | None") -> str | None:
+    """Read *task*'s stop reason, tolerating Task implementations without one.
+
+    The built-in tasks record ``_stop_reason``; a hand-rolled Task that merely
+    satisfies the protocol need not, so a missing attribute reads as None.
+    """
+    return getattr(task, "_stop_reason", None)
+
+
+def _stop_child(task: "Task", reason: str | None) -> None:
+    """Stop *task*, forwarding *reason*, tolerating a reason-less ``stop()``.
+
+    The Task protocol declares ``stop(reason=None)``, but a hand-rolled Task may
+    predate the reason parameter and define ``stop()`` with no argument. Such a
+    task still satisfies the protocol structurally, so a cascade must not break
+    on it: a binding ``TypeError`` (raised before the body runs, so there is no
+    double-stop) falls back to a reason-less stop.
+    """
+    try:
+        task.stop(reason)
+    except TypeError:
+        task.stop()
+
+
+class MultiException(Exception):
+    """Aggregate of several child exceptions raised by a MultiTask.
+
+    Raised by ``MultiTask.wait()`` when more than one child task failed: a
+    single failure re-raises that child's own exception directly, so a
+    ``MultiException`` always carries at least two. ``exceptions`` holds the
+    child exceptions in task order; the message combines *message* with each
+    child's string form so a log line shows what actually went wrong.
+    """
+
+    def __init__(self, message: str, exceptions: Iterable[BaseException]) -> None:
+        self.exceptions = list(exceptions)
+        detail = "; ".join(f"{type(e).__name__}: {e}" for e in self.exceptions)
+        super().__init__(f"{message}: {detail}" if detail else message)
 
 
 # ---------------------------------------------------------------------------
@@ -113,31 +166,66 @@ class SemanticStack:
         return tuple(dict(frame) for frame in self._var.get())
 
     def snapshot(self) -> "SemanticSnapshot":
-        """Capture the current stack state for later restoration."""
-        return SemanticSnapshot(self, self._var.get())
+        """Capture the current stack state as pure data for later restoration.
 
-
-class SemanticSnapshot:
-    """An immutable capture of a SemanticStack's frames at a point in time."""
-
-    def __init__(self, stack: SemanticStack, frames: tuple[Frame, ...]) -> None:
-        self._stack = stack
-        self._frames = frames
+        The returned snapshot holds only the captured frames — no reference to
+        this stack — so it is picklable (when its values are) and can be
+        restored into any same-shaped stack via ``stack.restore()``.
+        """
+        return SemanticSnapshot(self._var.get())
 
     @contextlib.contextmanager
-    def restore(self) -> Iterator[None]:
-        """Install the captured frames as the current stack for this block.
+    def restore(
+        self, snapshot_or_frames: "SemanticSnapshot | Iterable[dict[str, Any]]"
+    ) -> Iterator[None]:
+        """Install the given frames onto THIS stack for the block, then reset.
+
+        Accepts either a ``SemanticSnapshot`` or an iterable of frame dicts
+        (e.g. the output of ``frames()``, which after a serialization round-trip
+        is a *list* of dicts) — both list and tuple forms are handled.
 
         Restoring replaces whatever frames are currently on the stack for the
         duration of the block; on exit the previous state is reset. A thread
         that already had frames sees them hidden — not merged — while the
-        snapshot is active.
+        restored frames are active.
+
+        Restoration is a REPLAY of already-validated frames, so it BYPASSES the
+        ``required``-key check that ``__call__`` enforces: the frames may have
+        been produced by a stack with different required keys (or by another
+        process entirely), and must not be re-validated here.
         """
-        token = self._stack._var.set(self._frames)
+        if isinstance(snapshot_or_frames, SemanticSnapshot):
+            frames = snapshot_or_frames._frames
+        else:
+            # An iterable of dicts (list or tuple), e.g. from a serialized
+            # frames() payload. Convert each to a structurally-immutable Frame.
+            frames = tuple(tuple(d.items()) for d in snapshot_or_frames)
+        token = self._var.set(frames)
         try:
             yield
         finally:
-            self._stack._var.reset(token)
+            self._var.reset(token)
+
+
+class SemanticSnapshot:
+    """An immutable, pure-data capture of a stack's frames at a point in time.
+
+    Holds only the captured frames — no reference to the originating stack — so
+    it is picklable when its frame values are picklable, and can therefore cross
+    both thread and process boundaries. Restore it onto any stack via
+    ``stack.restore(snapshot)``.
+    """
+
+    def __init__(self, frames: tuple[Frame, ...]) -> None:
+        self._frames = frames
+
+    def frames(self) -> tuple[dict[str, Any], ...]:
+        """Return the captured frames as fresh dicts, outermost-first.
+
+        Mirrors ``SemanticStack.frames()`` output shape, for callers that want
+        to serialize the snapshot's contents.
+        """
+        return tuple(dict(frame) for frame in self._frames)
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +257,7 @@ class Task(Protocol):
     def result(self) -> Any: ...
 
     def wait(self, timeout: float | None = None) -> Any: ...
-    def stop(self) -> None: ...
+    def stop(self, reason: str | None = None) -> None: ...
     def add_finish_callback(
         self, fn: Callable[[Any, BaseException | None], Any]
     ) -> None: ...
@@ -205,7 +293,12 @@ class ThroughlineNameFilter(logging.Filter):
     """Inject ``throughline.collect("name")`` into each log record as ``throughline``."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.throughline = task_chain()
+        # Only set if absent: the originating process tags the record with its
+        # own throughline, and a record may be re-handled elsewhere (e.g. a log
+        # server re-emitting records received from other processes) where the
+        # current throughline is unrelated. First writer — the emitter — wins.
+        if not hasattr(record, "throughline"):
+            record.throughline = task_chain()
         return True
 
 
@@ -267,7 +360,7 @@ def check_stop() -> None:
     """Raise Stopped if the current task has been stopped. Equivalent to sleep(0)."""
     task = current_task()
     if task is not None and task.is_stopped:
-        raise Stopped()
+        raise _stopped(_task_stop_reason(task))
 
 
 def sleep(seconds: float) -> None:
@@ -284,11 +377,14 @@ def sleep(seconds: float) -> None:
     woken = threading.Event()
     with _stop_waker(woken.set):
         if task.is_stopped:
-            raise Stopped()
+            raise _stopped(_task_stop_reason(task))
         # woken.wait() returns True only if stop() set the event; a timeout
-        # (the full sleep elapsed without a stop) returns False.
-        if woken.wait(seconds):
-            raise Stopped()
+        # (the full sleep elapsed without a stop) returns False. A non-finite
+        # duration means "wait until stopped" — Event.wait cannot take an
+        # infinite timeout, so pass None to block until the stop signal arrives.
+        timeout = None if seconds == float("inf") else seconds
+        if woken.wait(timeout):
+            raise _stopped(_task_stop_reason(task))
 
 
 def poll(
@@ -359,7 +455,7 @@ class Queue:
             with self._cond:
                 while True:
                     if task.is_stopped:
-                        raise Stopped()
+                        raise _stopped(_task_stop_reason(task))
                     if self._items:
                         item = self._items.popleft()
                         self._cond.notify_all()  # wake a putter waiting for space
@@ -445,7 +541,7 @@ class Event:
             with self._cond:
                 while not self._flag:
                     if task.is_stopped:
-                        raise Stopped()
+                        raise _stopped(_task_stop_reason(task))
                     remaining = _remaining(deadline)
                     if remaining is not None and remaining <= 0:
                         return self._flag
@@ -494,6 +590,10 @@ class _TaskCore:
 
         self._done = threading.Event()
         self._stop_requested = threading.Event()
+        # The reason recorded by the first stop(), or None for a reason-less
+        # stop. Read via the stop_reason property; threaded into the Stopped
+        # raised at each stop-aware site so logs can say WHY work was stopped.
+        self._stop_reason: str | None = None
         self._lock = threading.RLock()
         # A Condition over the same lock lets wait() park indefinitely and be
         # woken poll-free, either by _finish() (this task is done) or by a stop
@@ -519,6 +619,11 @@ class _TaskCore:
     @property
     def is_stopped(self) -> bool:
         return self._stop_requested.is_set()
+
+    @property
+    def stop_reason(self) -> str | None:
+        """The reason passed to the first stop(), or None for a reason-less stop."""
+        return self._stop_reason
 
     @property
     def result(self) -> Any:
@@ -567,22 +672,26 @@ class _TaskCore:
                 parent.remove_stop_callback(_nudge)
 
         if stopped_by_parent:
-            self.stop()
-            raise Stopped()
+            self.stop(_task_stop_reason(parent))
+            raise _stopped(_task_stop_reason(parent))
         if not self.is_done:
             return None
         if self._exception is not None:
             raise self._exception
         return self._result
 
-    def stop(self) -> None:
+    def stop(self, reason: str | None = None) -> None:
         """Request cooperative stop; fire stop callbacks; cascade to children.
 
-        Idempotent: the stop callbacks fire exactly once, on the first stop.
+        Idempotent: the stop callbacks fire exactly once, on the first stop, and
+        only that first stop records *reason*. A later stop() is a no-op and does
+        not overwrite the reason. The reason cascades to children so a parent
+        stop explains itself all the way down.
         """
         with self._lock:
             if self._stop_requested.is_set():
                 return  # already stopped; callbacks fired on the first stop
+            self._stop_reason = reason
             self._stop_requested.set()
             children = list(self._children)
             callbacks, self._stop_callbacks = list(self._stop_callbacks), []
@@ -595,7 +704,7 @@ class _TaskCore:
             except Exception:
                 _logger.exception("stop callback raised")
         for child in children:
-            child.stop()
+            _stop_child(child, reason)
 
     def add_finish_callback(
         self, fn: Callable[[Any, BaseException | None], Any]
@@ -667,16 +776,20 @@ class _TaskCore:
             parent._children.add(self)
 
     def _finish(self, result: Any = None, exc: BaseException | None = None) -> None:
-        self._result = result
-        self._exception = exc
-        self._mark_done()
+        """Complete the task; the first completion wins, later calls are no-ops.
 
-    def _mark_done(self) -> None:
-        """Mark the task done, wake any waiters poll-free, then run callbacks.
-
-        ``self._result`` / ``self._exception`` must already be set.
+        Recording the result/exception and marking done happen together under
+        the lock, so concurrent completers — e.g. ``resolve()`` racing
+        ``fail()``, or a stop callback resolving a Promise while ``stop()``
+        injects ``Stopped`` — cannot interleave and overwrite each other's
+        outcome. Waiters are woken poll-free; callbacks run after the lock is
+        released (a finish callback may take other locks).
         """
         with self._cond:
+            if self._done.is_set():
+                return
+            self._result = result
+            self._exception = exc
             self._done.set()
             self._cond.notify_all()
         self._run_callbacks()
@@ -693,9 +806,10 @@ class _TaskCore:
     def _stop_running_children(self) -> None:
         with self._lock:
             children = list(self._children)
+            reason = self._stop_reason
         for child in children:
             if not child.is_done:
-                child.stop()
+                _stop_child(child, reason)
 
 
 # ---------------------------------------------------------------------------
@@ -717,12 +831,28 @@ class ThreadTask(_TaskCore):
         name: str | None = None,
         detach: bool = False,
         on_finish: Callable[[Any, BaseException | None], Any] | None = None,
+        start: bool = True,
     ) -> None:
+        """Run fn in a new daemon thread.
+
+        With ``start=True`` (default) the thread is created and launched here,
+        as before. With ``start=False`` the thread is created but not launched;
+        the caller must call ``.start()`` to begin work. Deferred start lets a
+        caller attach finish/stop callbacks or connect signals BEFORE any work
+        runs, race-free: construct, register callbacks, then ``start()``. (This
+        is what acq4's Qt bridge needs: construct the QObject, connect Qt
+        signals, then start.) ``asynch()`` always starts immediately.
+        """
         super().__init__(fn, tuple(args), kwargs or {}, name, on_finish)
         self._detach = detach
         self._waited = False
+        self._started = False
 
-        # Register with the parent task (if any) so stop cascades.
+        # Context capture and parent registration both happen at construction
+        # time, NOT at start() time, regardless of `start`. The task inherits
+        # the context of the code that *created* it (copy_context here), and
+        # registers in the parent's child set immediately so a parent stop
+        # reaches even a not-yet-started child.
         self._register_with_parent()
 
         # Copy the calling context so the thread inherits both stacks (the
@@ -734,6 +864,19 @@ class ThreadTask(_TaskCore):
             daemon=True,
             name=self._name,
         )
+        if start:
+            self.start()
+
+    def start(self) -> None:
+        """Launch the daemon thread. Idempotent — extra calls are a no-op.
+
+        Calling start() on a task created with ``start=True`` (already running)
+        is also a no-op, so the method is always safe to call.
+        """
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
         self._thread.start()
 
     def wait(self, timeout: float | None = None) -> Any:
@@ -748,7 +891,7 @@ class ThreadTask(_TaskCore):
             exc: BaseException | None = None
             try:
                 if self.is_stopped:
-                    raise Stopped()
+                    raise _stopped(self._stop_reason)
                 result = self._fn(*self._args, **self._kwargs)
             except BaseException as e:
                 exc = e
@@ -806,7 +949,19 @@ def synch(fn: Callable) -> Callable:
     returned. synch is safe to apply whether or not a function was
     asynch-wrapped or returns a task.
     """
-    target = getattr(fn, "_asynch_wraps", fn)
+    func = getattr(fn, "__func__", None)
+    instance = getattr(fn, "__self__", None)
+    if func is not None and instance is not None and hasattr(func, "_asynch_wraps"):
+        # A bound method of an asynch-wrapped function: its attribute access
+        # proxies to the underlying wrapper, so de-wrapping naively would yield
+        # the *unbound* original and drop ``self``. Re-apply the binding.
+        wraps = func._asynch_wraps
+
+        def target(*args: Any, **kwargs: Any) -> Any:
+            return wraps(instance, *args, **kwargs)
+
+    else:
+        target = getattr(fn, "_asynch_wraps", fn)
 
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         result = target(*args, **kwargs)
@@ -841,7 +996,10 @@ class WorkTask(_TaskCore):
 
     def _execute(self) -> None:
         """Run the job body. Called by the worker thread."""
-        with self._throughline_snapshot.restore(), self._task_snapshot.restore():
+        with (
+            throughline.restore(self._throughline_snapshot),
+            _task_stack.restore(self._task_snapshot),
+        ):
             with task_context(self, self._name):
                 result = None
                 exc: BaseException | None = None
@@ -860,6 +1018,221 @@ class WorkTask(_TaskCore):
             else ("stopped" if self.is_stopped else "queued/running")
         )
         return f"<WorkTask {self._name!r} {status}>"
+
+
+# ---------------------------------------------------------------------------
+# Promise
+# ---------------------------------------------------------------------------
+
+
+class Promise(_TaskCore):
+    """A Task with no thread or body, completed externally. Implements the Task protocol.
+
+    Where ThreadTask and WorkTask are *body-driven* — a callable runs and its
+    return value (or exception) finishes the task — a Promise is *externally
+    completed*. It has no body and spawns no thread; some already-existing
+    producer finishes it by calling ``resolve()`` or ``fail()``. The intended
+    producers are things that are going to fire anyway: a hardware monitor
+    thread that notices a target reached, a socket-reply reader, a GUI callback,
+    a lock loop. Wrapping those in a ThreadTask would mean a useless parking
+    thread per result; a Promise is just the shared completion state.
+
+    A Promise otherwise participates fully in the Task protocol and the stop
+    hierarchy: it registers with the task that created it, so a parent stop
+    cascades to it; ``wait()`` blocks poll-free until completion and returns the
+    resolved value, re-raises a failed exception, or raises ``Stopped`` for a
+    stopped promise; finish and stop callbacks behave exactly as on the other
+    tasks.
+    """
+
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        on_finish: Callable[[Any, BaseException | None], Any] | None = None,
+    ) -> None:
+        # A Promise has no body — fn is unused. Pass a sensible default name so
+        # the _TaskCore name fallback never has to stringify a None callable.
+        super().__init__(
+            fn=None, args=(), kwargs={}, name=name or "Promise", on_finish=on_finish
+        )
+        # Register immediately so the creating task's stop cascades here.
+        self._register_with_parent()
+
+    def resolve(self, value: Any = None) -> None:
+        """Complete the promise successfully with *value*.
+
+        Idempotent: a no-op if the promise is already resolved, failed, or
+        stopped. Otherwise wakes any waiters poll-free and fires finish
+        callbacks with ``(value, None)``. ``_finish`` is the single completion
+        gate, so the first of several racing completers wins.
+        """
+        self._finish(result=value)
+
+    def fail(self, exc: BaseException) -> None:
+        """Complete the promise with an exception.
+
+        Idempotent: a no-op if the promise is already done. Otherwise wakes any
+        waiters poll-free; ``wait()`` will re-raise *exc* and finish callbacks
+        fire with ``(None, exc)``. ``_finish`` is the single completion gate, so
+        the first of several racing completers wins.
+        """
+        self._finish(exc=exc)
+
+    def stop(self, reason: str | None = None) -> None:
+        """Request stop, then complete the promise with ``Stopped``.
+
+        A stopped promise has no body to raise ``Stopped``, so it must complete
+        itself or its waiters would hang forever. ``super().stop()`` runs first:
+        it sets the stop flag (recording *reason*), fires stop callbacks (so an
+        external producer can abort its side-effects), and cascades to children.
+        A stop callback may legitimately resolve or fail the promise; ``_finish``
+        is idempotent, so the injected ``Stopped`` is a no-op when the promise is
+        already complete and otherwise wins. The injected ``Stopped`` carries the
+        recorded reason so a stopped promise's waiters learn WHY. Idempotent via
+        ``super().stop()``'s own guard.
+        """
+        super().stop(reason)
+        self._finish(exc=_stopped(self._stop_reason))
+
+    def __repr__(self) -> str:
+        status = (
+            "done" if self.is_done else ("stopped" if self.is_stopped else "pending")
+        )
+        return f"<Promise {self._name!r} {status}>"
+
+
+# ---------------------------------------------------------------------------
+# MultiTask
+# ---------------------------------------------------------------------------
+
+
+class MultiTask(_TaskCore):
+    """A bodyless Task that completes when ALL its child tasks complete.
+
+    Like ``Promise``, a MultiTask has no body and spawns no thread; it is driven
+    entirely by its children's finish callbacks. It aggregates several
+    already-running tasks into one waitable unit: ``wait()`` blocks until every
+    child has finished, then returns the list of child results (in task order)
+    or raises the combined error. It participates fully in the stop hierarchy —
+    it registers with the task that created it, so a parent stop cascades to it
+    and on to its children, and ``stop()`` stops every child before completing.
+
+    Completion rule:
+
+    - all children succeed → ``wait()`` returns the list of results, in order;
+    - exactly one child fails → ``wait()`` re-raises THAT child's exception;
+    - two or more fail → ``wait()`` raises ``MultiException`` whose
+      ``exceptions`` holds them, in task order.
+    """
+
+    def __init__(
+        self,
+        tasks: Iterable[Task],
+        name: str | None = None,
+        *,
+        on_finish: Callable[[Any, BaseException | None], Any] | None = None,
+    ) -> None:
+        super().__init__(
+            fn=None, args=(), kwargs={}, name=name or "MultiTask", on_finish=on_finish
+        )
+        self._tasks: list[Task] = list(tasks)
+        # Register immediately so the creating task's stop cascades here (and on
+        # to the children via stop()).
+        self._register_with_parent()
+
+        n = len(self._tasks)
+        self._child_results: list[Any] = [None] * n
+        self._child_excs: list[BaseException | None] = [None] * n
+        # Remaining count guards the construction-time race: add_finish_callback
+        # fires synchronously for an already-finished child, so a child may call
+        # _child_finished before the rest are registered. By initialising
+        # remaining to n up front and decrementing per callback, the "all done"
+        # check (remaining == 0) is correct no matter when each callback fires —
+        # including entirely during this loop for all-already-done children.
+        self._remaining = n
+        if n == 0:
+            # No children to wait on: complete immediately with an empty list.
+            self._finish(result=[])
+            return
+        for i, task in enumerate(self._tasks):
+            task.add_finish_callback(functools.partial(self._child_finished, i))
+
+    @property
+    def tasks(self) -> tuple[Task, ...]:
+        """The child tasks this MultiTask aggregates, in order."""
+        return tuple(self._tasks)
+
+    def _child_finished(
+        self, index: int, result: Any, exc: BaseException | None
+    ) -> None:
+        """Record one child's outcome; complete the MultiTask when all are in.
+
+        Under the lock we only record the child's result/exception and decrement
+        the remaining count, snapshotting what we need. The completion decision
+        and ``_finish()`` happen OUTSIDE the lock (matching _TaskCore: a finish
+        callback may take other locks), guarded by ``is_done`` so a stop() that
+        already completed the MultiTask wins the race.
+        """
+        with self._lock:
+            self._child_results[index] = result
+            self._child_excs[index] = exc
+            self._remaining -= 1
+            if self._remaining != 0 or self._done.is_set():
+                return
+            results = list(self._child_results)
+            excs = [e for e in self._child_excs if e is not None]
+        if self.is_done:
+            return
+        if self.is_stopped or (excs and all(isinstance(e, Stopped) for e in excs)):
+            # The children finished because a stop is propagating: either this
+            # task was stopped directly (stop() cascades to the children), or a
+            # grandparent stop reached the children before it reached us (the
+            # parent's child set is unordered). Either way the outcome is a stop,
+            # so report a single Stopped rather than a MultiException of the
+            # children's Stoppeds. stop() also self-completes as a backstop.
+            reason = self._stop_reason
+            if reason is None:
+                # A grandparent stop reached the children before us, so our own
+                # reason is not set yet. Recover it from a child's Stopped so the
+                # single Stopped we report still explains itself.
+                reason = next(
+                    (str(e) for e in excs if isinstance(e, Stopped) and str(e)),
+                    None,
+                )
+            self._finish(exc=_stopped(reason))
+        elif not excs:
+            self._finish(result=results)
+        elif len(excs) == 1:
+            self._finish(exc=excs[0])
+        else:
+            self._finish(exc=MultiException("Multiple tasks failed", excs))
+
+    def stop(self, reason: str | None = None) -> None:
+        """Stop every child, then this task; complete with Stopped if still open.
+
+        Each child's own stop drives ``_child_finished``, which would normally
+        complete the MultiTask. But a child that does not complete on stop must
+        not leave this task's waiters hanging, so — mirroring ``Promise.stop`` —
+        we self-complete with ``Stopped`` if still incomplete afterwards. The
+        injected ``Stopped`` carries the recorded reason. Idempotent via
+        ``super().stop()``'s own guard.
+        """
+        # Set our own stop flag BEFORE cascading to the children: each child's
+        # stop() drives _child_finished synchronously, and that handler checks
+        # self.is_stopped to report a single Stopped rather than aggregating the
+        # children's Stoppeds into a MultiException. super().stop() also records
+        # the reason and fires our stop callbacks.
+        super().stop(reason)
+        for t in self._tasks:
+            _stop_child(t, reason)
+        self._finish(exc=_stopped(self._stop_reason))
+
+    def __repr__(self) -> str:
+        status = (
+            "done" if self.is_done else ("stopped" if self.is_stopped else "pending")
+        )
+        return f"<MultiTask {self._name!r} {status} ({len(self._tasks)} tasks)>"
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +1302,7 @@ class WorkerThread:
             task: WorkTask = item
             if task.is_stopped:
                 # Skip a job that was stopped before it ever ran.
-                task._finish(exc=Stopped())
+                task._finish(exc=_stopped(task._stop_reason))
                 continue
 
             task._execute()
@@ -941,12 +1314,15 @@ class WorkerThread:
 
 __all__ = [
     "Stopped",
+    "MultiException",
     "SemanticStack",
     "SemanticSnapshot",
     "throughline",
     "Task",
     "ThreadTask",
     "WorkTask",
+    "Promise",
+    "MultiTask",
     "WorkerThread",
     "asynch",
     "synch",
