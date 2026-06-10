@@ -424,6 +424,44 @@ callbacks (letting the external producer abort its side-effects) and then
 completes the promise with `Stopped` so its waiters never hang. `stop(reason)`
 carries the reason into that injected `Stopped`.
 
+### `MultiTask` — aggregate several running tasks into one
+
+Sometimes you have several tasks already running and want to treat them as a
+single waitable unit: block until they have **all** finished, collect their
+results, surface their errors together, and stop them as a group. `MultiTask` is
+that aggregator. Like `Promise` it is **bodyless and threadless** — it spawns no
+thread, and is driven entirely by its children's finish callbacks.
+
+```python
+from gentletask import MultiTask, ThreadTask
+
+a = ThreadTask(lambda: 1, name="a")
+b = ThreadTask(lambda: 2, name="b")
+c = ThreadTask(lambda: 3, name="c")
+
+both = MultiTask([a, b, c], name="gather")
+print(both.wait())   # blocks until all three finish -> [1, 2, 3] (task order)
+```
+
+`wait()` returns the list of child results **in task order**. Errors aggregate
+by count:
+
+- all children succeed → `wait()` returns the list of results;
+- exactly one child fails → `wait()` re-raises **that** child's exception
+  directly (no wrapping);
+- two or more fail → `wait()` raises `MultiException`, whose `.exceptions` holds
+  the failing children's exceptions in task order and whose message combines
+  them.
+
+`stop(reason)` stops every child and then this task, completing with `Stopped`
+(carrying the reason) so waiters never hang even if a child does not complete on
+stop. A `MultiTask` created inside a running task registers as that task's child,
+so a parent `stop()` cascades through the `MultiTask` to all of its children.
+Because `add_finish_callback` fires immediately for an already-finished child, a
+`MultiTask` constructed over a mix of already-done and still-pending children
+counts them all correctly and only completes once the last pending child
+finishes.
+
 ### Logging integration
 
 `ThroughlineNameFilter` injects `throughline.collect("name")` onto every log
@@ -582,6 +620,7 @@ to use the stop-aware primitives.
 | Name | Description |
 | --- | --- |
 | `Stopped` | Raised inside a task when `stop()` has been requested. Carries the optional `reason` passed to `stop()` as its message (`str(Stopped("foo")) == "foo"`; a reason-less `Stopped()` is empty). Unwinds normally; `finally` blocks run. |
+| `MultiException(message, exceptions)` | Aggregate raised by `MultiTask.wait()` when more than one child failed. `.exceptions` holds the child exceptions in task order; the message combines `message` with each child's string form. |
 
 ### Tasks
 
@@ -591,6 +630,7 @@ to use the stop-aware primitives.
 | `ThreadTask(fn, args=(), kwargs=None, *, name=None, detach=False, on_finish=None, start=True)` | Runs `fn` in a new daemon thread; implements `Task`. With `start=False`, call `.start()` to launch (idempotent). |
 | `WorkTask(fn, args, kwargs, name=None)` | One job queued to a `WorkerThread`; implements `Task`. Usually created via `WorkerThread.submit`. |
 | `Promise(name=None, *, on_finish=None)` | A `Task` with no thread or body, completed externally via `resolve(value)` / `fail(exc)`; implements `Task`. Idempotent completion; `stop(reason=None)` completes it with `Stopped` carrying the reason. |
+| `MultiTask(tasks, name=None, *, on_finish=None)` | A bodyless, threadless `Task` that completes when ALL its child `tasks` complete; implements `Task`. `wait()` returns the list of child results in task order, re-raises a lone child failure, or raises `MultiException` for two or more. `stop(reason=None)` stops every child then completes with `Stopped`. `tasks` exposes the children. |
 | `WorkerThread(name=None)` | Long-lived worker thread that serializes submitted jobs. `submit(...)` returns a `WorkTask`; `stop()` drains queued jobs and shuts down. |
 | `asynch(fn, name=None, detach=False, on_finish=None)` | Returns a launcher that starts `fn` in a new `ThreadTask` when called. |
 | `synch(fn)` | Returns a synchronous version of `fn` that de-wraps `asynch` and awaits returned tasks, yielding a concrete value. |

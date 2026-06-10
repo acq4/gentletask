@@ -415,6 +415,78 @@ poll-free wake-on-done / wake-on-parent-stop semantics as `ThreadTask`.
 
 ---
 
+## `MultiTask`
+
+A bodyless, threadless `Task` that aggregates several already-running tasks into
+one waitable unit and completes when **all** of its children complete. Like
+`Promise` it spawns no thread and has no body; it is driven entirely by its
+children's finish callbacks. Use it to wait for a group of tasks together,
+collect their results in order, surface their combined errors, and stop them as
+a unit. It participates fully in the Task protocol and the stop hierarchy.
+
+```python
+class MultiException(Exception):
+    def __init__(self, message: str, exceptions): ...   # .exceptions = list(exceptions)
+
+class MultiTask(_TaskCore):
+    def __init__(self, tasks, name: str | None = None, *, on_finish=None): ...
+    @property
+    def tasks(self) -> tuple[Task, ...]: ...            # the children, in order
+    def stop(self, reason: str | None = None) -> None: ...  # stop all children, then complete
+```
+
+**Construction.** Stores the children, registers with the creating task
+(`_register_with_parent`) so a parent `stop()` cascades through here to the
+children, and spawns **no thread**. `fn` is unused, so the name falls back to
+`"MultiTask"`. Pre-sizes per-child result/exception slots and a `remaining`
+counter initialized to the child count, then registers a per-index finish
+callback on each child via `functools.partial(self._child_finished, i)`.
+
+**Construction-time already-done race.** `add_finish_callback` fires
+**immediately** when the child is already finished, so a child may call
+`_child_finished` *during* the registration loop — before the other callbacks
+are registered. Initializing `remaining` to the full child count up front and
+decrementing once per callback makes the "all done" check (`remaining == 0`)
+correct regardless of when each callback fires, including the all-already-done
+case where every callback fires synchronously inside the loop. A zero-child
+`MultiTask` completes immediately with an empty result list.
+
+**`_child_finished(index, result, exc)`.** Under the lock, records the child's
+`result`/`exc`, decrements `remaining`, and — only when it reaches zero and the
+task is not already done — snapshots the results/exceptions. The completion
+decision and `_finish` happen **outside the lock** (a finish callback may take
+other locks; matching `_TaskCore` conventions), guarded by `is_done` so a
+concurrent `stop()` that already completed the task wins. Completion rule:
+
+- no child exceptions → `_finish(result=list(child_results))`;
+- exactly one exception → `_finish(exc=that_exception)` (re-raised directly,
+  unwrapped);
+- two or more → `_finish(exc=MultiException("Multiple tasks failed", exceptions))`.
+
+If a stop is propagating when the last child finishes — either this task was
+stopped directly, or a grandparent stop reached the children first (a parent's
+child set is unordered) — it completes with a single `Stopped` rather than
+aggregating the children's `Stopped`s into a `MultiException`.
+
+**`stop(reason=None)`.** Sets this task's own stop flag first via
+`super().stop(reason)` (recording the reason, firing stop callbacks), then stops
+every child. Setting the flag before cascading lets `_child_finished` see
+`is_stopped` and report a single `Stopped` rather than a `MultiException` of the
+children's `Stopped`s. Finally, if still incomplete (a child that does not
+complete on stop), it self-completes with `Stopped` carrying the reason so
+waiters never hang. Idempotent via `super().stop()`'s guard.
+
+**`wait(timeout=None)`.** Inherited: returns the list of child results in task
+order, re-raises the lone child exception or the aggregated `MultiException`, or
+raises `Stopped` for a stopped `MultiTask`.
+
+**`MultiException`.** Carries `.exceptions` (the failing children's exceptions,
+in task order) and builds a combined message from *message* plus each child's
+string form. Raised only when two or more children fail — a single failure
+re-raises that child's own exception unwrapped.
+
+---
+
 ## `WorkerThread`
 
 A long-lived thread that serialises jobs.

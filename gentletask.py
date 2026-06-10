@@ -7,6 +7,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import contextvars
+import functools
 import logging
 import queue as _queue
 import threading
@@ -50,6 +51,22 @@ def _task_stop_reason(task: "Task | None") -> str | None:
     satisfies the protocol need not, so a missing attribute reads as None.
     """
     return getattr(task, "_stop_reason", None)
+
+
+class MultiException(Exception):
+    """Aggregate of several child exceptions raised by a MultiTask.
+
+    Raised by ``MultiTask.wait()`` when more than one child task failed: a
+    single failure re-raises that child's own exception directly, so a
+    ``MultiException`` always carries at least two. ``exceptions`` holds the
+    child exceptions in task order; the message combines *message* with each
+    child's string form so a log line shows what actually went wrong.
+    """
+
+    def __init__(self, message: str, exceptions: Iterable[BaseException]) -> None:
+        self.exceptions = list(exceptions)
+        detail = "; ".join(f"{type(e).__name__}: {e}" for e in self.exceptions)
+        super().__init__(f"{message}: {detail}" if detail else message)
 
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1069,133 @@ class Promise(_TaskCore):
 
 
 # ---------------------------------------------------------------------------
+# MultiTask
+# ---------------------------------------------------------------------------
+
+
+class MultiTask(_TaskCore):
+    """A bodyless Task that completes when ALL its child tasks complete.
+
+    Like ``Promise``, a MultiTask has no body and spawns no thread; it is driven
+    entirely by its children's finish callbacks. It aggregates several
+    already-running tasks into one waitable unit: ``wait()`` blocks until every
+    child has finished, then returns the list of child results (in task order)
+    or raises the combined error. It participates fully in the stop hierarchy —
+    it registers with the task that created it, so a parent stop cascades to it
+    and on to its children, and ``stop()`` stops every child before completing.
+
+    Completion rule:
+
+    - all children succeed → ``wait()`` returns the list of results, in order;
+    - exactly one child fails → ``wait()`` re-raises THAT child's exception;
+    - two or more fail → ``wait()`` raises ``MultiException`` whose
+      ``exceptions`` holds them, in task order.
+    """
+
+    def __init__(
+        self,
+        tasks: Iterable[Task],
+        name: str | None = None,
+        *,
+        on_finish: Callable[[Any, BaseException | None], Any] | None = None,
+    ) -> None:
+        super().__init__(
+            fn=None, args=(), kwargs={}, name=name or "MultiTask", on_finish=on_finish
+        )
+        self._tasks: list[Task] = list(tasks)
+        # Register immediately so the creating task's stop cascades here (and on
+        # to the children via stop()).
+        self._register_with_parent()
+
+        n = len(self._tasks)
+        self._child_results: list[Any] = [None] * n
+        self._child_excs: list[BaseException | None] = [None] * n
+        # Remaining count guards the construction-time race: add_finish_callback
+        # fires synchronously for an already-finished child, so a child may call
+        # _child_finished before the rest are registered. By initialising
+        # remaining to n up front and decrementing per callback, the "all done"
+        # check (remaining == 0) is correct no matter when each callback fires —
+        # including entirely during this loop for all-already-done children.
+        self._remaining = n
+        if n == 0:
+            # No children to wait on: complete immediately with an empty list.
+            self._finish(result=[])
+            return
+        for i, task in enumerate(self._tasks):
+            task.add_finish_callback(functools.partial(self._child_finished, i))
+
+    @property
+    def tasks(self) -> tuple[Task, ...]:
+        """The child tasks this MultiTask aggregates, in order."""
+        return tuple(self._tasks)
+
+    def _child_finished(
+        self, index: int, result: Any, exc: BaseException | None
+    ) -> None:
+        """Record one child's outcome; complete the MultiTask when all are in.
+
+        Under the lock we only record the child's result/exception and decrement
+        the remaining count, snapshotting what we need. The completion decision
+        and ``_finish()`` happen OUTSIDE the lock (matching _TaskCore: a finish
+        callback may take other locks), guarded by ``is_done`` so a stop() that
+        already completed the MultiTask wins the race.
+        """
+        with self._lock:
+            self._child_results[index] = result
+            self._child_excs[index] = exc
+            self._remaining -= 1
+            if self._remaining != 0 or self._done.is_set():
+                return
+            results = list(self._child_results)
+            excs = [e for e in self._child_excs if e is not None]
+        if self.is_done:
+            return
+        if self.is_stopped or (excs and all(isinstance(e, Stopped) for e in excs)):
+            # The children finished because a stop is propagating: either this
+            # task was stopped directly (stop() cascades to the children), or a
+            # grandparent stop reached the children before it reached us (the
+            # parent's child set is unordered). Either way the outcome is a stop,
+            # so report a single Stopped rather than a MultiException of the
+            # children's Stoppeds. stop() also self-completes as a backstop.
+            self._finish(exc=_stopped(self._stop_reason))
+        elif not excs:
+            self._finish(result=results)
+        elif len(excs) == 1:
+            self._finish(exc=excs[0])
+        else:
+            self._finish(exc=MultiException("Multiple tasks failed", excs))
+
+    def stop(self, reason: str | None = None) -> None:
+        """Stop every child, then this task; complete with Stopped if still open.
+
+        Each child's own stop drives ``_child_finished``, which would normally
+        complete the MultiTask. But a child that does not complete on stop must
+        not leave this task's waiters hanging, so — mirroring ``Promise.stop`` —
+        we self-complete with ``Stopped`` if still incomplete afterwards. The
+        injected ``Stopped`` carries the recorded reason. Idempotent via
+        ``super().stop()``'s own guard.
+        """
+        # Set our own stop flag BEFORE cascading to the children: each child's
+        # stop() drives _child_finished synchronously, and that handler checks
+        # self.is_stopped to report a single Stopped rather than aggregating the
+        # children's Stoppeds into a MultiException. super().stop() also records
+        # the reason and fires our stop callbacks.
+        super().stop(reason)
+        for t in self._tasks:
+            t.stop(reason)
+        with self._lock:
+            if self._done.is_set():
+                return
+        self._finish(exc=_stopped(self._stop_reason))
+
+    def __repr__(self) -> str:
+        status = (
+            "done" if self.is_done else ("stopped" if self.is_stopped else "pending")
+        )
+        return f"<MultiTask {self._name!r} {status} ({len(self._tasks)} tasks)>"
+
+
+# ---------------------------------------------------------------------------
 # WorkerThread
 # ---------------------------------------------------------------------------
 
@@ -1130,6 +1274,7 @@ class WorkerThread:
 
 __all__ = [
     "Stopped",
+    "MultiException",
     "SemanticStack",
     "SemanticSnapshot",
     "throughline",
@@ -1137,6 +1282,7 @@ __all__ = [
     "ThreadTask",
     "WorkTask",
     "Promise",
+    "MultiTask",
     "WorkerThread",
     "asynch",
     "synch",

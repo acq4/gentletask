@@ -14,6 +14,8 @@ import pytest
 
 from gentletask import (
     Event,
+    MultiException,
+    MultiTask,
     Promise,
     Queue,
     SemanticSnapshot,
@@ -1862,3 +1864,160 @@ class TestStopReason:
         with pytest.raises(Stopped) as info:
             t.wait(timeout=1.0)
         assert str(info.value) == "never started"
+
+
+# ---------------------------------------------------------------------------
+# MultiTask
+# ---------------------------------------------------------------------------
+
+
+class TestMultiTask:
+    def test_is_task(self):
+        assert isinstance(MultiTask([]), Task)
+
+    def test_all_success_returns_results_in_order(self):
+        a = Promise()
+        b = Promise()
+        c = Promise()
+        m = MultiTask([a, b, c])
+        b.resolve("b")
+        a.resolve("a")
+        c.resolve("c")
+        assert m.wait(timeout=1.0) == ["a", "b", "c"]
+        assert m.is_done
+
+    def test_empty_completes_with_empty_list(self):
+        m = MultiTask([])
+        assert m.wait(timeout=1.0) == []
+
+    def test_one_child_fails_reraises_that_exception(self):
+        a = Promise()
+        b = Promise()
+        m = MultiTask([a, b])
+        boom = ValueError("boom")
+        a.resolve("ok")
+        b.fail(boom)
+        with pytest.raises(ValueError, match="boom") as info:
+            m.wait(timeout=1.0)
+        assert info.value is boom
+
+    def test_two_failures_raise_multi_exception(self):
+        a = Promise()
+        b = Promise()
+        c = Promise()
+        m = MultiTask([a, b, c])
+        e1 = ValueError("one")
+        e2 = RuntimeError("two")
+        a.fail(e1)
+        b.resolve("ok")
+        c.fail(e2)
+        with pytest.raises(MultiException) as info:
+            m.wait(timeout=1.0)
+        assert info.value.exceptions == [e1, e2]
+        # The combined message names the children's errors.
+        assert "one" in str(info.value)
+        assert "two" in str(info.value)
+
+    def test_stop_stops_all_children_and_completes(self):
+        a = Promise()
+        b = Promise()
+        m = MultiTask([a, b])
+        m.stop()
+        assert a.is_stopped
+        assert b.is_stopped
+        assert m.is_done
+        with pytest.raises(Stopped):
+            m.wait(timeout=1.0)
+
+    def test_child_already_done_before_construction_counted(self):
+        done = Promise()
+        done.resolve("early")
+        pending = Promise()
+        m = MultiTask([done, pending])
+        # The already-finished child must not, on its own, complete the
+        # MultiTask: the pending child still has to finish.
+        assert not m.is_done
+        pending.resolve("late")
+        assert m.wait(timeout=1.0) == ["early", "late"]
+
+    def test_all_children_already_done_before_construction(self):
+        a = Promise()
+        a.resolve(1)
+        b = Promise()
+        b.resolve(2)
+        m = MultiTask([a, b])
+        assert m.is_done
+        assert m.wait(timeout=1.0) == [1, 2]
+
+    def test_spawns_no_thread(self):
+        before = threading.active_count()
+        a = Promise()
+        b = Promise()
+        m = MultiTask([a, b], name="no-thread-multi")
+        a.resolve(1)
+        b.resolve(2)
+        m.wait(timeout=1.0)
+        assert threading.active_count() == before
+        assert not any(t.name == "no-thread-multi" for t in threading.enumerate())
+
+    def test_parent_stop_cascades_to_multitask(self):
+        captured = {}
+
+        def parent_fn():
+            a = Promise(name="child-a")
+            b = Promise(name="child-b")
+            m = MultiTask([a, b], name="child-multi")
+            captured["multi"] = m
+            captured["a"] = a
+            captured["b"] = b
+            m.wait()  # never completed except via the parent stop cascade
+
+        parent = ThreadTask(parent_fn)
+        deadline = time.monotonic() + 1.0
+        while "multi" not in captured and time.monotonic() < deadline:
+            time.sleep(0.005)
+        parent.stop()
+        with pytest.raises(Stopped):
+            parent.wait(timeout=1.0)
+        assert captured["multi"].is_stopped
+        assert captured["multi"].is_done
+        assert captured["a"].is_stopped
+        assert captured["b"].is_stopped
+
+    def test_finish_callback_fires_with_results_on_success(self):
+        a = Promise()
+        b = Promise()
+        seen = []
+        m = MultiTask([a, b], on_finish=lambda v, e: seen.append((v, e)))
+        a.resolve("x")
+        b.resolve("y")
+        assert seen == [(["x", "y"], None)]
+
+    def test_add_finish_callback_fires_immediately_if_done(self):
+        a = Promise()
+        a.resolve(1)
+        b = Promise()
+        b.resolve(2)
+        m = MultiTask([a, b])
+        seen = []
+        m.add_finish_callback(lambda v, e: seen.append((v, e)))
+        assert seen == [([1, 2], None)]
+
+    def test_tasks_accessor_returns_children(self):
+        a = Promise()
+        b = Promise()
+        m = MultiTask([a, b])
+        assert list(m.tasks) == [a, b]
+
+    def test_default_name(self):
+        m = MultiTask([])
+        assert "MultiTask" in repr(m) or m._name == "MultiTask"
+
+    def test_multi_exception_holds_exceptions(self):
+        e1 = ValueError("a")
+        e2 = RuntimeError("b")
+        me = MultiException("several failed", [e1, e2])
+        assert me.exceptions == [e1, e2]
+        assert "several failed" in str(me)
+        assert "a" in str(me)
+        assert "b" in str(me)
