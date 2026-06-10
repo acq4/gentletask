@@ -783,6 +783,24 @@ class TestSynch:
         synch(asynch(lambda: seen.append(current_task())))()
         assert seen == [None]
 
+    def test_synch_of_bound_asynch_method_keeps_self_and_runs_inline(self):
+        # synch on a BOUND method of an asynch-wrapped function must re-apply the
+        # binding (not call the unbound original and drop self), and run inline.
+        threads = []
+
+        class Mover:
+            base = 10
+
+            @asynch
+            def go(self, x):
+                threads.append(threading.current_thread())
+                return self.base + x
+
+        m = Mover()
+        result = synch(m.go)(5)
+        assert result == 15
+        assert threads == [threading.current_thread()]
+
     def test_waits_for_returned_thread_task(self):
         # A plain function that returns a ThreadTask: synch waits for it.
         def make():

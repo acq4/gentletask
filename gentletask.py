@@ -924,7 +924,19 @@ def synch(fn: Callable) -> Callable:
     returned. synch is safe to apply whether or not a function was
     asynch-wrapped or returns a task.
     """
-    target = getattr(fn, "_asynch_wraps", fn)
+    func = getattr(fn, "__func__", None)
+    instance = getattr(fn, "__self__", None)
+    if func is not None and instance is not None and hasattr(func, "_asynch_wraps"):
+        # A bound method of an asynch-wrapped function: its attribute access
+        # proxies to the underlying wrapper, so de-wrapping naively would yield
+        # the *unbound* original and drop ``self``. Re-apply the binding.
+        wraps = func._asynch_wraps
+
+        def target(*args: Any, **kwargs: Any) -> Any:
+            return wraps(instance, *args, **kwargs)
+
+    else:
+        target = getattr(fn, "_asynch_wraps", fn)
 
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         result = target(*args, **kwargs)
