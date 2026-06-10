@@ -1030,6 +1030,16 @@ class TestThroughlineNameFilter:
         f.filter(record)
         assert record.throughline == ()
 
+    def test_does_not_overwrite_existing_throughline(self):
+        # A record tagged by its originating process must survive re-handling
+        # elsewhere (e.g. a log server) under an unrelated current throughline.
+        f = ThroughlineNameFilter()
+        record = logging.LogRecord("test", logging.INFO, "", 0, "msg", (), None)
+        record.throughline = ("from_child",)
+        with throughline(name="server_side"):
+            f.filter(record)
+        assert record.throughline == ("from_child",)
+
 
 # ---------------------------------------------------------------------------
 # Stoppable primitives

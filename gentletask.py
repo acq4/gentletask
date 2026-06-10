@@ -278,7 +278,12 @@ class ThroughlineNameFilter(logging.Filter):
     """Inject ``throughline.collect("name")`` into each log record as ``throughline``."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.throughline = task_chain()
+        # Only set if absent: the originating process tags the record with its
+        # own throughline, and a record may be re-handled elsewhere (e.g. a log
+        # server re-emitting records received from other processes) where the
+        # current throughline is unrelated. First writer — the emitter — wins.
+        if not hasattr(record, "throughline"):
+            record.throughline = task_chain()
         return True
 
 
