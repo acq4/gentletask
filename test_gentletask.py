@@ -1,5 +1,5 @@
-# Tests for the gentletask v7 reference implementation.
-# Covers SemanticStack/throughline, ThreadTask, WorkTask, WorkerThread,
+# Tests for the gentletask reference implementation.
+# Covers SemanticStack/throughline, ThreadTask, ManualTask, WorkerThread,
 # stop propagation, the stop-aware primitives, and the logging filter.
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from gentletask import (
     Event,
     MultiException,
     MultiTask,
-    Promise,
+    ManualTask,
     Queue,
     SemanticSnapshot,
     SemanticStack,
@@ -24,7 +24,6 @@ from gentletask import (
     Task,
     ThreadTask,
     ThroughlineNameFilter,
-    WorkTask,
     WorkerThread,
     asynch,
     check_stop,
@@ -838,7 +837,7 @@ class TestSynch:
 
 
 # ---------------------------------------------------------------------------
-# WorkerThread and WorkTask
+# WorkerThread and its ManualTask jobs
 # ---------------------------------------------------------------------------
 
 
@@ -1602,16 +1601,16 @@ class TestCallbackErrorsLogged:
 
 
 # ---------------------------------------------------------------------------
-# Promise — externally-completed Task with no thread/body
+# ManualTask — externally-completed Task with no thread/body
 # ---------------------------------------------------------------------------
 
 
-class TestPromise:
+class TestManualTask:
     def test_is_task(self):
-        assert isinstance(Promise(), Task)
+        assert isinstance(ManualTask(), Task)
 
     def test_resolve_makes_wait_return_value(self):
-        p = Promise()
+        p = ManualTask()
         p.resolve(42)
         assert p.wait() == 42
         assert p.result == 42
@@ -1619,7 +1618,7 @@ class TestPromise:
 
     def test_resolve_spawns_no_thread(self):
         before = threading.active_count()
-        p = Promise(name="no-thread")
+        p = ManualTask(name="no-thread")
         p.resolve(1)
         p.wait()
         # No parking thread was ever created for the promise.
@@ -1627,12 +1626,12 @@ class TestPromise:
         assert not any(t.name == "no-thread" for t in threading.enumerate())
 
     def test_resolve_default_value_is_none(self):
-        p = Promise()
+        p = ManualTask()
         p.resolve()
         assert p.wait() is None
 
     def test_fail_reraises_through_wait(self):
-        p = Promise()
+        p = ManualTask()
         boom = ValueError("boom")
         p.fail(boom)
         with pytest.raises(ValueError, match="boom"):
@@ -1640,7 +1639,7 @@ class TestPromise:
         assert p.is_done
 
     def test_stop_before_completion_raises_stopped(self):
-        p = Promise()
+        p = ManualTask()
         fired = []
         p.add_stop_callback(lambda: fired.append(True))
         p.stop()
@@ -1655,52 +1654,52 @@ class TestPromise:
             p.wait()
 
     def test_resolve_is_idempotent(self):
-        p = Promise()
+        p = ManualTask()
         p.resolve(1)
         p.resolve(2)  # ignored
         assert p.wait() == 1
 
     def test_resolve_after_fail_ignored(self):
-        p = Promise()
+        p = ManualTask()
         p.fail(RuntimeError("nope"))
         p.resolve(7)  # ignored
         with pytest.raises(RuntimeError, match="nope"):
             p.wait()
 
     def test_fail_after_resolve_ignored(self):
-        p = Promise()
+        p = ManualTask()
         p.resolve(3)
         p.fail(RuntimeError("nope"))  # ignored
         assert p.wait() == 3
 
     def test_on_finish_fires_with_value_on_resolve(self):
         seen = []
-        p = Promise(on_finish=lambda v, e: seen.append((v, e)))
+        p = ManualTask(on_finish=lambda v, e: seen.append((v, e)))
         p.resolve(5)
         assert seen == [(5, None)]
 
     def test_add_finish_callback_fires_on_fail(self):
         seen = []
-        p = Promise()
+        p = ManualTask()
         exc = ValueError("x")
         p.add_finish_callback(lambda v, e: seen.append((v, e)))
         p.fail(exc)
         assert seen == [(None, exc)]
 
     def test_add_finish_callback_fires_immediately_if_done(self):
-        p = Promise()
+        p = ManualTask()
         p.resolve(11)
         seen = []
         p.add_finish_callback(lambda v, e: seen.append((v, e)))
         assert seen == [(11, None)]
 
     def test_parent_stop_cascades_to_promise(self):
-        # A Promise created inside a running ThreadTask is stopped when the
+        # A ManualTask created inside a running ThreadTask is stopped when the
         # parent stops, and the parent's wait() on it unblocks with Stopped.
         captured = {}
 
         def parent_fn():
-            p = Promise(name="child-promise")
+            p = ManualTask(name="child-promise")
             captured["promise"] = p
             p.wait()  # never resolved; only the parent stop frees it
 
@@ -1716,7 +1715,7 @@ class TestPromise:
         assert captured["promise"].is_done
 
     def test_consumer_in_sibling_task_gets_value(self):
-        p = Promise(name="shared")
+        p = ManualTask(name="shared")
 
         def consumer():
             return p.wait()
@@ -1729,7 +1728,7 @@ class TestPromise:
     def test_stop_callback_resolution_wins_over_injected_stopped(self):
         # A stop callback may legitimately complete the promise; that completion
         # must win over the Stopped that stop() would otherwise inject.
-        p = Promise()
+        p = ManualTask()
         p.add_stop_callback(lambda: p.resolve("rescued"))
         p.stop()
         assert p.wait(timeout=1.0) == "rescued"
@@ -1742,7 +1741,7 @@ class TestPromise:
         # result could overwrite the winner's between the two views.
         boom = RuntimeError("boom")
         for _ in range(200):
-            p = Promise()
+            p = ManualTask()
             seen: list = []
             p.add_finish_callback(lambda v, e: seen.append((v, e)))
             barrier = threading.Barrier(2)
@@ -1775,7 +1774,7 @@ class TestPromise:
         # If the producer resolves the promise before a consuming sibling is
         # stopped, the value stands — stopping the now-finished sibling cannot
         # retroactively corrupt the already-completed promise.
-        p = Promise(name="shared2")
+        p = ManualTask(name="shared2")
 
         def consumer():
             return p.wait()
@@ -1786,7 +1785,7 @@ class TestPromise:
         assert sibling.wait(timeout=1.0) == "locked-in"
         sibling.stop()  # late stop on a finished task cascades to the promise
         # The already-resolved value stands; stop cannot overwrite a finished
-        # promise's result (Promise.stop only injects Stopped if not yet done).
+        # promise's result (ManualTask.stop only injects Stopped if not yet done).
         assert p.wait() == "locked-in"
 
     def test_stopping_consuming_sibling_cascades_to_promise(self):
@@ -1794,7 +1793,7 @@ class TestPromise:
         # (the inherited Task wait() contract): stopping the consumer stops the
         # promise too, cleanly, with no hung waiter. This is propagation, not
         # corruption — the promise ends up consistently stopped+done.
-        p = Promise(name="shared3")
+        p = ManualTask(name="shared3")
 
         def consumer():
             p.wait()
@@ -1810,8 +1809,8 @@ class TestPromise:
             p.wait(timeout=1.0)
 
     def test_default_name(self):
-        p = Promise()
-        assert "Promise" in repr(p) or p._name == "Promise"
+        p = ManualTask()
+        assert "ManualTask" in repr(p) or p._name == "ManualTask"
 
 
 # ---------------------------------------------------------------------------
@@ -1895,7 +1894,7 @@ class TestStopReason:
         assert str(info.value) == "event reason"
 
     def test_promise_stop_reason_reaches_waiter(self):
-        p = Promise(name="promised")
+        p = ManualTask(name="promised")
         p.stop(reason="why")
         with pytest.raises(Stopped) as info:
             p.wait(timeout=1.0)
@@ -1986,9 +1985,9 @@ class TestMultiTask:
         assert isinstance(MultiTask([]), Task)
 
     def test_all_success_returns_results_in_order(self):
-        a = Promise()
-        b = Promise()
-        c = Promise()
+        a = ManualTask()
+        b = ManualTask()
+        c = ManualTask()
         m = MultiTask([a, b, c])
         b.resolve("b")
         a.resolve("a")
@@ -2001,8 +2000,8 @@ class TestMultiTask:
         assert m.wait(timeout=1.0) == []
 
     def test_one_child_fails_reraises_that_exception(self):
-        a = Promise()
-        b = Promise()
+        a = ManualTask()
+        b = ManualTask()
         m = MultiTask([a, b])
         boom = ValueError("boom")
         a.resolve("ok")
@@ -2012,9 +2011,9 @@ class TestMultiTask:
         assert info.value is boom
 
     def test_two_failures_raise_multi_exception(self):
-        a = Promise()
-        b = Promise()
-        c = Promise()
+        a = ManualTask()
+        b = ManualTask()
+        c = ManualTask()
         m = MultiTask([a, b, c])
         e1 = ValueError("one")
         e2 = RuntimeError("two")
@@ -2029,8 +2028,8 @@ class TestMultiTask:
         assert "two" in str(info.value)
 
     def test_stop_stops_all_children_and_completes(self):
-        a = Promise()
-        b = Promise()
+        a = ManualTask()
+        b = ManualTask()
         m = MultiTask([a, b])
         m.stop()
         assert a.is_stopped
@@ -2040,9 +2039,9 @@ class TestMultiTask:
             m.wait(timeout=1.0)
 
     def test_child_already_done_before_construction_counted(self):
-        done = Promise()
+        done = ManualTask()
         done.resolve("early")
-        pending = Promise()
+        pending = ManualTask()
         m = MultiTask([done, pending])
         # The already-finished child must not, on its own, complete the
         # MultiTask: the pending child still has to finish.
@@ -2051,9 +2050,9 @@ class TestMultiTask:
         assert m.wait(timeout=1.0) == ["early", "late"]
 
     def test_all_children_already_done_before_construction(self):
-        a = Promise()
+        a = ManualTask()
         a.resolve(1)
-        b = Promise()
+        b = ManualTask()
         b.resolve(2)
         m = MultiTask([a, b])
         assert m.is_done
@@ -2061,8 +2060,8 @@ class TestMultiTask:
 
     def test_spawns_no_thread(self):
         before = threading.active_count()
-        a = Promise()
-        b = Promise()
+        a = ManualTask()
+        b = ManualTask()
         m = MultiTask([a, b], name="no-thread-multi")
         a.resolve(1)
         b.resolve(2)
@@ -2074,8 +2073,8 @@ class TestMultiTask:
         captured = {}
 
         def parent_fn():
-            a = Promise(name="child-a")
-            b = Promise(name="child-b")
+            a = ManualTask(name="child-a")
+            b = ManualTask(name="child-b")
             m = MultiTask([a, b], name="child-multi")
             captured["multi"] = m
             captured["a"] = a
@@ -2095,8 +2094,8 @@ class TestMultiTask:
         assert captured["b"].is_stopped
 
     def test_finish_callback_fires_with_results_on_success(self):
-        a = Promise()
-        b = Promise()
+        a = ManualTask()
+        b = ManualTask()
         seen = []
         m = MultiTask([a, b], on_finish=lambda v, e: seen.append((v, e)))
         a.resolve("x")
@@ -2104,9 +2103,9 @@ class TestMultiTask:
         assert seen == [(["x", "y"], None)]
 
     def test_add_finish_callback_fires_immediately_if_done(self):
-        a = Promise()
+        a = ManualTask()
         a.resolve(1)
-        b = Promise()
+        b = ManualTask()
         b.resolve(2)
         m = MultiTask([a, b])
         seen = []
@@ -2114,8 +2113,8 @@ class TestMultiTask:
         assert seen == [([1, 2], None)]
 
     def test_tasks_accessor_returns_children(self):
-        a = Promise()
-        b = Promise()
+        a = ManualTask()
+        b = ManualTask()
         m = MultiTask([a, b])
         assert list(m.tasks) == [a, b]
 
@@ -2133,8 +2132,8 @@ class TestMultiTask:
         assert "b" in str(me)
 
     def test_stop_reason_cascades_to_children_and_waiter(self):
-        a = Promise()
-        b = Promise()
+        a = ManualTask()
+        b = ManualTask()
         m = MultiTask([a, b])
         m.stop(reason="halt")
         for child in (a, b):
@@ -2150,8 +2149,8 @@ class TestMultiTask:
         # finish with Stopped while this MultiTask's own reason is still unset.
         # The single Stopped we report must recover the reason from a child
         # rather than degrade to a reason-less Stopped.
-        a = Promise()
-        b = Promise()
+        a = ManualTask()
+        b = ManualTask()
         m = MultiTask([a, b])
         a.stop(reason="child reason")
         b.stop(reason="child reason")
