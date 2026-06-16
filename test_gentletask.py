@@ -1040,6 +1040,109 @@ class TestThroughlineNameFilter:
             f.filter(record)
         assert record.throughline == ("from_child",)
 
+    def test_exception_carries_raise_site_throughline_after_unwind(self):
+        # An error raised inside a throughline block is usually logged far above
+        # where it was raised, after the block has already unwound (a task's
+        # exception re-raised by wait() at the top level). The record should
+        # carry the throughline active at the *raise* site, not the shorter
+        # chain that happens to be active where the record is finally created.
+        f = ThroughlineNameFilter()
+        try:
+            with throughline(name="outer"):
+                with throughline(name="inner"):
+                    raise ValueError("boom")
+        except ValueError as e:
+            exc = e
+        # We are now outside both blocks: the live chain is empty here.
+        assert task_chain() == ()
+        record = logging.LogRecord(
+            "test",
+            logging.ERROR,
+            "",
+            0,
+            "msg",
+            (),
+            (type(exc), exc, exc.__traceback__),
+        )
+        f.filter(record)
+        assert record.throughline == ("outer", "inner")
+
+    def test_innermost_throughline_wins_on_unwind(self):
+        # As the exception passes out through nested blocks, the innermost
+        # (richest, most specific) chain is the one that sticks.
+        f = ThroughlineNameFilter()
+        try:
+            with throughline(name="a"):
+                with throughline(name="b"):
+                    with throughline(name="c"):
+                        raise ValueError("boom")
+        except ValueError as e:
+            exc = e
+        record = logging.LogRecord(
+            "test",
+            logging.ERROR,
+            "",
+            0,
+            "msg",
+            (),
+            (type(exc), exc, exc.__traceback__),
+        )
+        f.filter(record)
+        assert record.throughline == ("a", "b", "c")
+
+    def test_thread_task_exception_carries_raise_site_throughline(self):
+        # The motivating acq4 case: work runs in a child task wrapped in its own
+        # throughline frame; the exception is re-raised by wait() at the top and
+        # logged there. The raise-site chain must survive crossing the task
+        # boundary and the unwind back up to the logging call.
+        f = ThroughlineNameFilter()
+
+        def boom():
+            with throughline(name="pipette into site"):
+                raise ValueError("No valid position within bounds")
+
+        with throughline(name="state clean"):
+            task = asynch(boom)()
+            try:
+                task.wait()
+            except ValueError as e:
+                exc = e
+
+        record = logging.LogRecord(
+            "test",
+            logging.ERROR,
+            "",
+            0,
+            "msg",
+            (),
+            (type(exc), exc, exc.__traceback__),
+        )
+        f.filter(record)
+        assert "state clean" in record.throughline
+        assert "pipette into site" in record.throughline
+        assert record.throughline[-1] == "pipette into site"
+
+    def test_untagged_exception_falls_back_to_live_chain(self):
+        # An exception raised with no throughline active carries no tag, so a
+        # record logged later under a live chain still reports that live chain.
+        f = ThroughlineNameFilter()
+        try:
+            raise ValueError("boom")
+        except ValueError as e:
+            exc = e
+        record = logging.LogRecord(
+            "test",
+            logging.ERROR,
+            "",
+            0,
+            "msg",
+            (),
+            (type(exc), exc, exc.__traceback__),
+        )
+        with throughline(name="logged_here"):
+            f.filter(record)
+        assert record.throughline == ("logged_here",)
+
 
 # ---------------------------------------------------------------------------
 # Stoppable primitives
