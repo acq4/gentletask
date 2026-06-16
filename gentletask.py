@@ -15,7 +15,7 @@ import time
 import weakref
 from typing import Any, Callable, Iterable, Iterator, Protocol, runtime_checkable
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 _logger = logging.getLogger(__name__)
 
@@ -109,10 +109,19 @@ class SemanticStack:
     """
 
     def __init__(
-        self, name: str = "semantic_stack", *, required: Iterable[str] = ()
+        self,
+        name: str = "semantic_stack",
+        *,
+        required: Iterable[str] = (),
+        tag_exceptions: bool = False,
     ) -> None:
         self._label = name
         self._required: tuple[str, ...] = tuple(required)
+        # When set, an exception unwinding out of a __call__ block is tagged with
+        # the name-chain that was active at the raise site (see __call__). This is
+        # what lets a log emitted far above the failure still report where it
+        # actually happened, after the block has unwound.
+        self._tag_exceptions = tag_exceptions
         # A per-instance ContextVar so independent stacks stay isolated.
         self._var: contextvars.ContextVar[tuple[Frame, ...]] = contextvars.ContextVar(
             name, default=()
@@ -133,6 +142,14 @@ class SemanticStack:
         token = self._var.set(self._var.get() + (frame,))
         try:
             yield
+        except BaseException as exc:
+            # The block failed. Capture the chain *before* the finally pops this
+            # frame, so the recorded narrative includes the raise site. Outer
+            # blocks unwind afterward and find the tag already set, so the
+            # innermost (richest) chain is the one that sticks.
+            if self._tag_exceptions:
+                _tag_exception(exc, self.collect("name"))
+            raise
         finally:
             self._var.reset(token)
 
@@ -232,10 +249,34 @@ class SemanticSnapshot:
 # Module-level singleton
 # ---------------------------------------------------------------------------
 
+# The attribute under which an exception carries the throughline name-chain that
+# was active where it was raised. Read back by ThroughlineNameFilter so a log
+# emitted above the failure still reports where it actually happened.
+_THROUGHLINE_EXC_ATTR = "_gentletask_throughline"
+
+
+def _tag_exception(exc: BaseException, chain: tuple[str, ...]) -> None:
+    """Record *chain* on *exc* as its raise-site throughline, first writer wins.
+
+    The innermost ``throughline`` block to unwind tags the exception; outer
+    blocks find the tag already present and leave it, so the most specific chain
+    survives. Best-effort: a few C-level exceptions reject attribute assignment,
+    in which case the tag is simply skipped.
+    """
+    if getattr(exc, _THROUGHLINE_EXC_ATTR, None) is not None:
+        return
+    try:
+        setattr(exc, _THROUGHLINE_EXC_ATTR, chain)
+    except (AttributeError, TypeError):
+        pass
+
+
 # A continuous thread of meaning running through all concurrent execution.
 # Names only: this is the fun, human-readable narrative. Every frame must
 # carry a `name`. Logging filters and user code share this one instance.
-throughline = SemanticStack("throughline", required=("name",))
+# tag_exceptions=True so an error logged above where it was raised still carries
+# the narrative from the raise site.
+throughline = SemanticStack("throughline", required=("name",), tag_exceptions=True)
 
 # A private stack with a single purpose: tracking which Task is running. Every
 # frame carries exactly the running `task`. current_task() reads from here, so
@@ -289,8 +330,24 @@ def task_chain() -> tuple[str, ...]:
     return throughline.collect("name")
 
 
+def _record_throughline(record: logging.LogRecord) -> tuple[str, ...]:
+    """The throughline to tag *record* with: raise-site chain if any, else live.
+
+    A record logging an exception (``exc_info`` set) prefers the chain captured
+    where that exception was raised — otherwise an error logged above the
+    failure would report only the unrelated chain active at the logging call.
+    Records with no such exception fall back to the currently active chain.
+    """
+    exc_info = record.exc_info
+    if isinstance(exc_info, tuple) and exc_info[1] is not None:
+        captured = getattr(exc_info[1], _THROUGHLINE_EXC_ATTR, None)
+        if captured is not None:
+            return captured
+    return task_chain()
+
+
 class ThroughlineNameFilter(logging.Filter):
-    """Inject ``throughline.collect("name")`` into each log record as ``throughline``."""
+    """Inject the throughline name-chain into each log record as ``throughline``."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         # Only set if absent: the originating process tags the record with its
@@ -298,7 +355,7 @@ class ThroughlineNameFilter(logging.Filter):
         # server re-emitting records received from other processes) where the
         # current throughline is unrelated. First writer — the emitter — wins.
         if not hasattr(record, "throughline"):
-            record.throughline = task_chain()
+            record.throughline = _record_throughline(record)
         return True
 
 
