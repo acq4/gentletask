@@ -44,6 +44,11 @@ class Timeout(TimeoutError):
     only the wait deadline (and not, say, a worker body's own timeout). A
     parent-stop wakes ``wait()`` with ``Stopped`` instead, so the two reasons a
     bounded ``wait()`` can fail are never confused.
+
+    Each task further raises its *own* subclass, reachable as ``task.Timeout``,
+    so ``except task.Timeout`` catches only that task's deadline — never a
+    ``Timeout`` that merely propagated up from an inner ``wait`` as the task's
+    result. The raised instance carries ``.task``, the task whose wait elapsed.
     """
 
 
@@ -676,6 +681,9 @@ class _TaskCore:
         self._result: Any = None
         self._exception: BaseException | None = None
         self._detach = False
+        # This task's own Timeout subclass, built lazily by the Timeout property
+        # the first time it is needed (most tasks never time out).
+        self._timeout_cls: type[Timeout] | None = None
 
         if on_finish is not None:
             self._callbacks.append(on_finish)
@@ -685,6 +693,25 @@ class _TaskCore:
     @property
     def is_done(self) -> bool:
         return self._done.is_set()
+
+    @property
+    def Timeout(self) -> type[Timeout]:
+        """This task's own ``Timeout`` subclass, for catching only its deadline.
+
+        ``wait(timeout=...)`` raises ``self.Timeout`` (a subclass of the
+        module-level ``Timeout``), so ``except some_task.Timeout`` catches only
+        *that* task's deadline — never a ``Timeout`` that propagated up from an
+        inner ``wait`` as this task's result. Built once per task and cached;
+        ``except gentletask.Timeout`` / ``except TimeoutError`` still catch any.
+        """
+        cls = self._timeout_cls
+        if cls is None:
+            with self._lock:
+                cls = self._timeout_cls
+                if cls is None:
+                    cls = type("Timeout", (Timeout,), {})
+                    self._timeout_cls = cls
+        return cls
 
     @property
     def is_stopped(self) -> bool:
@@ -710,9 +737,12 @@ class _TaskCore:
         deadline — it never returns to signal that. So a returned value (incl.
         ``None``) always means the task finished, a ``Stopped`` means a stop
         cascaded in, and a ``Timeout`` means the deadline elapsed; the three are
-        never confused. ``timeout=None`` waits forever and so never times out;
-        ``timeout=0`` raises ``Timeout`` at once unless already done. The
-        ``result`` property waits without a timeout, so it never raises Timeout.
+        never confused. The raised exception is ``self.Timeout`` (a per-task
+        subclass), so ``except self.Timeout`` catches only this task's deadline,
+        not a ``Timeout`` re-raised from a failed task body. ``timeout=None``
+        waits forever and so never times out; ``timeout=0`` raises ``Timeout``
+        at once unless already done. The ``result`` property waits without a
+        timeout, so it never raises Timeout.
         """
         parent = current_task()
         if parent is not None and parent is not self and not self._detach:
@@ -753,7 +783,9 @@ class _TaskCore:
             self.stop(_task_stop_reason(parent))
             raise _stopped(_task_stop_reason(parent))
         if not self.is_done:
-            raise Timeout(f"timed out after {timeout}s waiting for {self!r}")
+            exc = self.Timeout(f"timed out after {timeout}s waiting for {self!r}")
+            exc.task = self
+            raise exc
         if self._exception is not None:
             raise self._exception
         return self._result

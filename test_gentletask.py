@@ -1490,6 +1490,52 @@ class TestWaitSemantics:
         assert t.wait(timeout=1.0) is None
         assert t.is_done
 
+    def test_own_timeout_caught_by_per_task_class(self):
+        # A task's own wait deadline raises that task's .Timeout subclass.
+        barrier = threading.Event()
+        t = ThreadTask(barrier.wait, name="slow")
+        with pytest.raises(t.Timeout):
+            t.wait(timeout=0.05)
+        barrier.set()
+
+    def test_per_task_timeout_classes_are_distinct(self):
+        a = ThreadTask(lambda: None)
+        b = ThreadTask(lambda: None)
+        a.wait()
+        b.wait()
+        assert a.Timeout is a.Timeout  # stable per instance
+        assert a.Timeout is not b.Timeout
+        assert issubclass(a.Timeout, Timeout)
+        assert issubclass(b.Timeout, Timeout)
+        assert not issubclass(a.Timeout, b.Timeout)
+
+    def test_inner_timeout_does_not_satisfy_outer_per_task_class(self):
+        # The motivating case: a Timeout escaping an inner wait propagates as
+        # the OUTER task's failure. The outer task's own .Timeout must NOT catch
+        # it, so a retry loop guarding on `task2.Timeout` surfaces the real
+        # failure instead of spinning forever.
+        inner_holder = {}
+
+        def fn1():
+            sleep(100)
+
+        def fn2():
+            inner = asynch(fn1, name="inner")()
+            inner_holder["inner"] = inner
+            inner.wait(timeout=0.05)  # raises inner.Timeout, uncaught here
+
+        task2 = asynch(fn2, name="outer")()
+        try:
+            with pytest.raises(Timeout) as info:
+                task2.wait(timeout=2.0)
+            inner = inner_holder["inner"]
+            # task2 completed by failing with the INNER task's Timeout.
+            assert isinstance(info.value, inner.Timeout)
+            assert not isinstance(info.value, task2.Timeout)
+            assert info.value.task is inner
+        finally:
+            inner_holder["inner"].stop()  # let the sleep(100) thread unwind
+
     def test_result_reraises_on_each_access(self):
         def boom():
             raise ValueError("kaboom")

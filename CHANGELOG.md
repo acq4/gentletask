@@ -27,6 +27,12 @@ changes bump the minor version and are called out under **Migration** below.
   subclasses the builtin `TimeoutError`, so `except TimeoutError` catches it
   idiomatically while `except gentletask.Timeout` catches only the wait
   deadline. Exported in `__all__`.
+- Per-task `Timeout` subclasses, reachable as `task.Timeout` (each carrying
+  `.task`). `wait(timeout=...)` raises `self.Timeout`, so `except
+  some_task.Timeout` catches only *that* task's deadline — not a `Timeout` that
+  escaped an inner `wait` and propagated up as the task's result. This avoids a
+  retry loop guarding on `except Timeout` mistaking an inner task's propagated
+  timeout for its own deadline and spinning forever.
 
 ### Migration
 
@@ -53,6 +59,23 @@ changes bump the minor version and are called out under **Migration** below.
   `result` property waits without a timeout, so it never raises `Timeout`.
 - `timeout=0` now raises `Timeout` immediately unless the task is already done
   (previously it returned `None`). Use `task.is_done` for a non-blocking check.
+- In a retry loop that should continue only while a task is still running,
+  guard on the *per-task* class so a propagated inner timeout is not mistaken
+  for the loop's own deadline:
+
+  ```python
+  while True:
+      try:
+          task.wait(timeout=20)
+          break
+      except task.Timeout:   # not bare `except Timeout`
+          continue           # only OUR 20s wait elapsed; keep waiting
+  ```
+
+  With a bare `except Timeout`, a `Timeout` raised inside the task's body (e.g.
+  an inner `wait(timeout=...)` the body forgot to catch) is re-raised by
+  `task.wait()` and would be swallowed by the loop, spinning forever instead of
+  surfacing the failure.
 
 ## [0.3.0] - 2026-06-16
 

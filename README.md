@@ -620,7 +620,7 @@ to use the stop-aware primitives.
 | Name | Description |
 | --- | --- |
 | `Stopped` | Raised inside a task when `stop()` has been requested. Carries the optional `reason` passed to `stop()` as its message (`str(Stopped("foo")) == "foo"`; a reason-less `Stopped()` is empty). Unwinds normally; `finally` blocks run. |
-| `Timeout` | Raised by `Task.wait(timeout=...)` when the deadline elapses before the task is done — `wait()` never *returns* to signal a timeout, so a returned `None` unambiguously means the task finished with a `None` result. Subclasses the builtin `TimeoutError` (so `except TimeoutError` also catches it). A parent-stop raises `Stopped` instead, so a bounded `wait()`'s two failure modes are never confused. |
+| `Timeout` | Raised by `Task.wait(timeout=...)` when the deadline elapses before the task is done — `wait()` never *returns* to signal a timeout, so a returned `None` unambiguously means the task finished with a `None` result. Subclasses the builtin `TimeoutError` (so `except TimeoutError` also catches it). A parent-stop raises `Stopped` instead, so a bounded `wait()`'s two failure modes are never confused. Each task raises its own subclass `task.Timeout` (carrying `.task`), so `except some_task.Timeout` catches only *that* task's deadline — not a `Timeout` that propagated up from an inner `wait` as the task's result. |
 | `MultiException(message, exceptions)` | Aggregate raised by `MultiTask.wait()` when more than one child failed. `.exceptions` holds the child exceptions in task order; the message combines `message` with each child's string form. |
 
 ### Tasks

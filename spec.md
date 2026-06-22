@@ -559,6 +559,15 @@ it idiomatically while `except Timeout` catches only the wait deadline. A
 parent-stop wakes `wait()` with `Stopped` instead, so a bounded `wait()`'s two
 failure modes — deadline vs. stop — are never confused.
 
+Each task additionally raises its *own* `Timeout` subclass, reachable as
+`task.Timeout` (built lazily and cached). `wait(timeout=...)` raises
+`self.Timeout`, so `except task.Timeout` catches only *that* task's deadline —
+not a `Timeout` that escaped an inner `wait` and propagated up as the task's
+result. Without this, a retry loop guarding on `except Timeout` around
+`outer.wait(timeout=...)` would mistake an inner task's propagated `Timeout` for
+its own deadline and spin forever. The raised instance carries `.task`, the task
+whose wait elapsed.
+
 **`sleep(seconds)`.** Drop-in for `time.sleep`. Blocks on the stop signal
 itself, so a stop unblocks it immediately (raising `Stopped`); otherwise it
 returns once `seconds` have elapsed. No polling interval — the wait is exact.
