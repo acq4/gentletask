@@ -34,21 +34,21 @@ class Stopped(Exception):
     """
 
 
-class Timeout(TimeoutError):
-    """Raised by ``Task.wait(timeout=...)`` when the task is not done in time.
+class _Timeout(TimeoutError):
+    """Internal base for the per-task wait-timeout exceptions.
 
-    Dedicated to the wait deadline alone, so a ``None`` return from ``wait()``
-    unambiguously means "the task finished and its result was None" — never
-    "timed out". Subclasses the builtin ``TimeoutError`` so ``except
-    TimeoutError`` catches it idiomatically, while ``except Timeout`` catches
-    only the wait deadline (and not, say, a worker body's own timeout). A
-    parent-stop wakes ``wait()`` with ``Stopped`` instead, so the two reasons a
+    Not part of the public API — callers never catch this directly. Each task
+    raises its *own* subclass, reachable as ``task.Timeout``, so ``except
+    task.Timeout`` catches only that task's deadline (and not a ``Timeout`` that
+    merely propagated up from an inner ``wait`` as the task's result). For a
+    broader catch, callers fall back to the builtin ``TimeoutError``, which this
+    subclasses. The raised instance carries ``.task``, the task whose wait
+    elapsed.
+
+    A timeout is raised — never returned — so a ``None`` return from ``wait()``
+    unambiguously means "the task finished and its result was None". A
+    parent-stop wakes ``wait()`` with ``Stopped`` instead, so the reasons a
     bounded ``wait()`` can fail are never confused.
-
-    Each task further raises its *own* subclass, reachable as ``task.Timeout``,
-    so ``except task.Timeout`` catches only that task's deadline — never a
-    ``Timeout`` that merely propagated up from an inner ``wait`` as the task's
-    result. The raised instance carries ``.task``, the task whose wait elapsed.
     """
 
 
@@ -683,7 +683,7 @@ class _TaskCore:
         self._detach = False
         # This task's own Timeout subclass, built lazily by the Timeout property
         # the first time it is needed (most tasks never time out).
-        self._timeout_cls: type[Timeout] | None = None
+        self._timeout_cls: type[_Timeout] | None = None
 
         if on_finish is not None:
             self._callbacks.append(on_finish)
@@ -695,21 +695,22 @@ class _TaskCore:
         return self._done.is_set()
 
     @property
-    def Timeout(self) -> type[Timeout]:
+    def Timeout(self) -> type[_Timeout]:
         """This task's own ``Timeout`` subclass, for catching only its deadline.
 
-        ``wait(timeout=...)`` raises ``self.Timeout`` (a subclass of the
-        module-level ``Timeout``), so ``except some_task.Timeout`` catches only
-        *that* task's deadline — never a ``Timeout`` that propagated up from an
-        inner ``wait`` as this task's result. Built once per task and cached;
-        ``except gentletask.Timeout`` / ``except TimeoutError`` still catch any.
+        ``wait(timeout=...)`` raises ``self.Timeout``, so ``except
+        some_task.Timeout`` catches only *that* task's deadline — never a
+        ``Timeout`` that propagated up from an inner ``wait`` as this task's
+        result. Built once per task and cached. For a broader catch (any wait
+        deadline, or an OS-level timeout), fall back to the builtin
+        ``TimeoutError``, which every ``task.Timeout`` subclasses.
         """
         cls = self._timeout_cls
         if cls is None:
             with self._lock:
                 cls = self._timeout_cls
                 if cls is None:
-                    cls = type("Timeout", (Timeout,), {})
+                    cls = type("Timeout", (_Timeout,), {})
                     self._timeout_cls = cls
         return cls
 
@@ -733,16 +734,16 @@ class _TaskCore:
         propagates to this task: the parent wakes this wait the moment it is
         stopped (poll-free), and we then stop ourselves and raise Stopped.
 
-        With a *timeout*, this raises ``Timeout`` if the task is not done by the
-        deadline — it never returns to signal that. So a returned value (incl.
-        ``None``) always means the task finished, a ``Stopped`` means a stop
-        cascaded in, and a ``Timeout`` means the deadline elapsed; the three are
-        never confused. The raised exception is ``self.Timeout`` (a per-task
-        subclass), so ``except self.Timeout`` catches only this task's deadline,
-        not a ``Timeout`` re-raised from a failed task body. ``timeout=None``
-        waits forever and so never times out; ``timeout=0`` raises ``Timeout``
-        at once unless already done. The ``result`` property waits without a
-        timeout, so it never raises Timeout.
+        With a *timeout*, this raises ``self.Timeout`` if the task is not done
+        by the deadline — it never returns to signal that. So a returned value
+        (incl. ``None``) always means the task finished, a ``Stopped`` means a
+        stop cascaded in, and a timeout means the deadline elapsed; the three
+        are never confused. Because the raised class is per-task, ``except
+        self.Timeout`` catches only this task's deadline, not a timeout
+        re-raised from a failed task body; fall back to the builtin
+        ``TimeoutError`` for a broader catch. ``timeout=None`` waits forever and
+        so never times out; ``timeout=0`` raises at once unless already done.
+        The ``result`` property waits without a timeout, so it never times out.
         """
         parent = current_task()
         if parent is not None and parent is not self and not self._detach:
@@ -1424,7 +1425,6 @@ class WorkerThread:
 
 __all__ = [
     "Stopped",
-    "Timeout",
     "MultiException",
     "SemanticStack",
     "SemanticSnapshot",

@@ -23,7 +23,6 @@ from gentletask import (
     Stopped,
     Task,
     ThreadTask,
-    Timeout,
     ThroughlineNameFilter,
     WorkTask,
     WorkerThread,
@@ -518,7 +517,7 @@ class TestThreadTask:
     def test_wait_timeout_raises(self):
         barrier = threading.Event()
         t = ThreadTask(barrier.wait)
-        with pytest.raises(Timeout):
+        with pytest.raises(t.Timeout):
             t.wait(timeout=0.05)
         barrier.set()
 
@@ -623,7 +622,7 @@ class TestThreadTaskDeferredStart:
     def test_wait_on_unstarted_times_out(self):
         t = ThreadTask(lambda: 1, start=False)
         # Not started, so it never completes; wait should time out -> raise.
-        with pytest.raises(Timeout):
+        with pytest.raises(t.Timeout):
             t.wait(timeout=0.1)
         assert not t.is_done
         t.start()
@@ -1468,17 +1467,17 @@ class TestWaitSemantics:
             return 99
 
         t = ThreadTask(fn)
-        with pytest.raises(Timeout):
+        with pytest.raises(t.Timeout):
             t.wait(timeout=0.05)  # not done yet
         release.set()
         assert t.wait(timeout=1.0) == 99  # re-waited to completion
 
     def test_timeout_is_a_timeouterror(self):
-        # Timeout subclasses the builtin TimeoutError, so callers may catch
-        # either the precise gentletask type or the idiomatic builtin.
-        assert issubclass(Timeout, TimeoutError)
+        # A task's Timeout subclasses the builtin TimeoutError, so callers may
+        # catch either the precise per-task type or the idiomatic builtin.
         barrier = threading.Event()
         t = ThreadTask(barrier.wait)
+        assert issubclass(t.Timeout, TimeoutError)
         with pytest.raises(TimeoutError):
             t.wait(timeout=0.05)
         barrier.set()
@@ -1505,8 +1504,8 @@ class TestWaitSemantics:
         b.wait()
         assert a.Timeout is a.Timeout  # stable per instance
         assert a.Timeout is not b.Timeout
-        assert issubclass(a.Timeout, Timeout)
-        assert issubclass(b.Timeout, Timeout)
+        assert issubclass(a.Timeout, TimeoutError)
+        assert issubclass(b.Timeout, TimeoutError)
         assert not issubclass(a.Timeout, b.Timeout)
 
     def test_inner_timeout_does_not_satisfy_outer_per_task_class(self):
@@ -1526,7 +1525,7 @@ class TestWaitSemantics:
 
         task2 = asynch(fn2, name="outer")()
         try:
-            with pytest.raises(Timeout) as info:
+            with pytest.raises(TimeoutError) as info:
                 task2.wait(timeout=2.0)
             inner = inner_holder["inner"]
             # task2 completed by failing with the INNER task's Timeout.
