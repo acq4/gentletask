@@ -309,7 +309,12 @@ subsequent `parent.stop()` will not cascade here.
 called from inside another task, `wait` registers a stop callback on that parent
 so a `parent.stop()` wakes the wait immediately; it then calls
 `self.stop(parent.stop_reason)` and raises `Stopped` carrying the parent's
-reason.
+reason. With a `timeout`, a deadline that elapses before the task is done raises
+`Timeout` — `wait` never *returns* to signal a timeout, so a returned value
+(including `None`) always means the task finished. `timeout=None` waits forever
+and never times out; `timeout=0` raises `Timeout` immediately unless already
+done. The `result` property waits without a timeout, so it never raises
+`Timeout`.
 
 **`__del__` cleanup.** A `ThreadTask` garbage-collected before `wait()` is
 called automatically calls `stop()` on itself and its children.
@@ -545,6 +550,14 @@ the optional `reason` passed to `stop()` as its message, so `str(Stopped("foo"))
 stopped current task — `check_stop`, `sleep`, `Queue.get`, `Event.wait`, `poll`
 (via `check_stop`), and `Task.wait`'s parent-cascade — supplies that task's
 `stop_reason`. Unwind normally; finally blocks run.
+
+**`Timeout`.** Exception raised by `Task.wait(timeout=...)` when the deadline
+elapses before the task is done. Dedicated to the wait deadline alone, so a
+`None` return from `wait()` unambiguously means the task finished with a `None`
+result. Subclasses the builtin `TimeoutError`, so `except TimeoutError` catches
+it idiomatically while `except Timeout` catches only the wait deadline. A
+parent-stop wakes `wait()` with `Stopped` instead, so a bounded `wait()`'s two
+failure modes — deadline vs. stop — are never confused.
 
 **`sleep(seconds)`.** Drop-in for `time.sleep`. Blocks on the stop signal
 itself, so a stop unblocks it immediately (raising `Stopped`); otherwise it

@@ -620,6 +620,7 @@ to use the stop-aware primitives.
 | Name | Description |
 | --- | --- |
 | `Stopped` | Raised inside a task when `stop()` has been requested. Carries the optional `reason` passed to `stop()` as its message (`str(Stopped("foo")) == "foo"`; a reason-less `Stopped()` is empty). Unwinds normally; `finally` blocks run. |
+| `Timeout` | Raised by `Task.wait(timeout=...)` when the deadline elapses before the task is done — `wait()` never *returns* to signal a timeout, so a returned `None` unambiguously means the task finished with a `None` result. Subclasses the builtin `TimeoutError` (so `except TimeoutError` also catches it). A parent-stop raises `Stopped` instead, so a bounded `wait()`'s two failure modes are never confused. |
 | `MultiException(message, exceptions)` | Aggregate raised by `MultiTask.wait()` when more than one child failed. `.exceptions` holds the child exceptions in task order; the message combines `message` with each child's string form. |
 
 ### Tasks
@@ -643,7 +644,7 @@ to use the stop-aware primitives.
 | `is_stopped: bool` | Whether a stop has been requested. |
 | `stop_reason` | Property; the `reason` passed to the first `stop()`, or `None` for a reason-less stop. |
 | `result` | Property; shorthand for `wait()`. |
-| `wait(timeout=None)` | Block until done, re-raising any worker exception. A stop on the calling parent propagates here and raises `Stopped` carrying the parent's reason. |
+| `wait(timeout=None)` | Block until done, re-raising any worker exception. A stop on the calling parent propagates here and raises `Stopped` carrying the parent's reason. With a `timeout`, raises `Timeout` if the task is not done by the deadline (never returns to signal it, so a returned `None` means the task finished). `timeout=None` waits forever; `result` uses no timeout, so it never raises `Timeout`. |
 | `stop(reason=None)` | Request cooperative stop; record `reason` (first stop only); fire stop callbacks once; cascade to children (passing the reason along). |
 | `add_finish_callback(fn)` | Call `fn(result, exception)` when the task finishes (immediately if already finished). |
 | `add_stop_callback(fn)` | Call zero-arg `fn()` once when the task is stopped (immediately if already stopped). |

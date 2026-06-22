@@ -15,7 +15,7 @@ import time
 import weakref
 from typing import Any, Callable, Iterable, Iterator, Protocol, runtime_checkable
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 _logger = logging.getLogger(__name__)
 
@@ -31,6 +31,19 @@ class Stopped(Exception):
     Carries the optional *reason* passed to ``stop()`` as its message, so
     ``str(Stopped("foo")) == "foo"`` and a reason-less ``Stopped()`` is empty.
     Unwinds normally; finally blocks run.
+    """
+
+
+class Timeout(TimeoutError):
+    """Raised by ``Task.wait(timeout=...)`` when the task is not done in time.
+
+    Dedicated to the wait deadline alone, so a ``None`` return from ``wait()``
+    unambiguously means "the task finished and its result was None" — never
+    "timed out". Subclasses the builtin ``TimeoutError`` so ``except
+    TimeoutError`` catches it idiomatically, while ``except Timeout`` catches
+    only the wait deadline (and not, say, a worker body's own timeout). A
+    parent-stop wakes ``wait()`` with ``Stopped`` instead, so the two reasons a
+    bounded ``wait()`` can fail are never confused.
     """
 
 
@@ -692,6 +705,14 @@ class _TaskCore:
         If called from inside another task, a stop request on that parent
         propagates to this task: the parent wakes this wait the moment it is
         stopped (poll-free), and we then stop ourselves and raise Stopped.
+
+        With a *timeout*, this raises ``Timeout`` if the task is not done by the
+        deadline — it never returns to signal that. So a returned value (incl.
+        ``None``) always means the task finished, a ``Stopped`` means a stop
+        cascaded in, and a ``Timeout`` means the deadline elapsed; the three are
+        never confused. ``timeout=None`` waits forever and so never times out;
+        ``timeout=0`` raises ``Timeout`` at once unless already done. The
+        ``result`` property waits without a timeout, so it never raises Timeout.
         """
         parent = current_task()
         if parent is not None and parent is not self and not self._detach:
@@ -732,7 +753,7 @@ class _TaskCore:
             self.stop(_task_stop_reason(parent))
             raise _stopped(_task_stop_reason(parent))
         if not self.is_done:
-            return None
+            raise Timeout(f"timed out after {timeout}s waiting for {self!r}")
         if self._exception is not None:
             raise self._exception
         return self._result
@@ -1371,6 +1392,7 @@ class WorkerThread:
 
 __all__ = [
     "Stopped",
+    "Timeout",
     "MultiException",
     "SemanticStack",
     "SemanticSnapshot",
