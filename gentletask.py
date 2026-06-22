@@ -1,6 +1,6 @@
-# Reference implementation of the gentletask v7 spec.
-# Provides the SemanticStack (`throughline`), stoppable Task hierarchy, and
-# stop-aware blocking primitives described in v7/spec.md.
+# Reference implementation of the gentletask concurrency model.
+# Provides the SemanticStack (`throughline`), a stoppable Task hierarchy, and
+# stop-aware blocking primitives.
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import time
 import weakref
 from typing import Any, Callable, Iterable, Iterator, Protocol, runtime_checkable
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 _logger = logging.getLogger(__name__)
 
@@ -643,11 +643,13 @@ class Event:
 
 
 class _TaskCore:
-    """State and behavior shared by ThreadTask and WorkTask.
+    """State and behavior shared by every concrete Task.
 
     Holds the done/stop events, child registry, result/exception, and the
-    finish-callback machinery. Subclasses provide their own scheduling and
-    context handling.
+    finish-callback machinery. Subclasses provide their own completion path: a
+    body run in a thread (ThreadTask), external completion (ManualTask, also
+    used by WorkerThread to back queued jobs), or aggregation of children
+    (MultiTask).
     """
 
     def __init__(
@@ -891,7 +893,7 @@ class _TaskCore:
 
         Recording the result/exception and marking done happen together under
         the lock, so concurrent completers — e.g. ``resolve()`` racing
-        ``fail()``, or a stop callback resolving a Promise while ``stop()``
+        ``fail()``, or a stop callback resolving a ManualTask while ``stop()``
         injects ``Stopped`` — cannot interleave and overwrite each other's
         outcome. Waiters are woken poll-free; callbacks run after the lock is
         released (a finish callback may take other locks).
@@ -1084,75 +1086,34 @@ def synch(fn: Callable) -> Callable:
 
 
 # ---------------------------------------------------------------------------
-# WorkTask
+# ManualTask
 # ---------------------------------------------------------------------------
 
 
-class WorkTask(_TaskCore):
-    """One job queued to a WorkerThread. Implements the Task protocol."""
+class ManualTask(_TaskCore):
+    """A Task with no body of its own, completed manually. Implements the Task protocol.
 
-    def __init__(
-        self,
-        fn: Callable[..., Any],
-        args: tuple,
-        kwargs: dict,
-        name: str | None = None,
-    ) -> None:
-        super().__init__(fn, args, kwargs, name)
-        # Snapshot the submitter's context at submit time. The job inherits the
-        # context of the code that caused it to be submitted, not the worker's.
-        # Both stacks travel: the narrative (throughline) and the task chain.
-        self._throughline_snapshot = throughline.snapshot()
-        self._task_snapshot = _task_stack.snapshot()
+    Where ThreadTask is *body-driven* — a callable runs and its return value (or
+    exception) finishes the task — a ManualTask is *manually completed*: it has
+    no body, and something outside it finishes it by calling ``resolve()`` or
+    ``fail()``. Two kinds of producer drive one:
 
-    def _execute(self) -> None:
-        """Run the job body. Called by the worker thread."""
-        with (
-            throughline.restore(self._throughline_snapshot),
-            _task_stack.restore(self._task_snapshot),
-        ):
-            with task_context(self, self._name):
-                result = None
-                exc: BaseException | None = None
-                try:
-                    result = self._fn(*self._args, **self._kwargs)
-                except BaseException as e:
-                    exc = e
-                finally:
-                    self._stop_running_children()
-                    self._finish(result=result, exc=exc)
+    - An already-existing producer that is going to fire anyway — a hardware
+      monitor thread that notices a target reached, a socket-reply reader, a GUI
+      callback, a lock loop. Wrapping those in a ThreadTask would mean a useless
+      parking thread per result; a ManualTask is just the shared completion
+      state, completed in-place when the producer fires.
+    - A ``WorkerThread``: ``submit()`` hands back a ManualTask and the worker
+      runs the submitted callable on its own thread, resolving the task with the
+      return value or failing it with the exception. The body is the worker's
+      private mechanism; to the submitter and to waiters it is an externally
+      completed task like any other.
 
-    def __repr__(self) -> str:
-        status = (
-            "done"
-            if self.is_done
-            else ("stopped" if self.is_stopped else "queued/running")
-        )
-        return f"<WorkTask {self._name!r} {status}>"
-
-
-# ---------------------------------------------------------------------------
-# Promise
-# ---------------------------------------------------------------------------
-
-
-class Promise(_TaskCore):
-    """A Task with no thread or body, completed externally. Implements the Task protocol.
-
-    Where ThreadTask and WorkTask are *body-driven* — a callable runs and its
-    return value (or exception) finishes the task — a Promise is *externally
-    completed*. It has no body and spawns no thread; some already-existing
-    producer finishes it by calling ``resolve()`` or ``fail()``. The intended
-    producers are things that are going to fire anyway: a hardware monitor
-    thread that notices a target reached, a socket-reply reader, a GUI callback,
-    a lock loop. Wrapping those in a ThreadTask would mean a useless parking
-    thread per result; a Promise is just the shared completion state.
-
-    A Promise otherwise participates fully in the Task protocol and the stop
+    A ManualTask otherwise participates fully in the Task protocol and the stop
     hierarchy: it registers with the task that created it, so a parent stop
     cascades to it; ``wait()`` blocks poll-free until completion and returns the
     resolved value, re-raises a failed exception, or raises ``Stopped`` for a
-    stopped promise; finish and stop callbacks behave exactly as on the other
+    stopped task; finish and stop callbacks behave exactly as on the other
     tasks.
     """
 
@@ -1162,28 +1123,28 @@ class Promise(_TaskCore):
         *,
         on_finish: Callable[[Any, BaseException | None], Any] | None = None,
     ) -> None:
-        # A Promise has no body — fn is unused. Pass a sensible default name so
-        # the _TaskCore name fallback never has to stringify a None callable.
+        # A ManualTask has no body — fn is unused. Pass a sensible default name
+        # so the _TaskCore name fallback never has to stringify a None callable.
         super().__init__(
-            fn=None, args=(), kwargs={}, name=name or "Promise", on_finish=on_finish
+            fn=None, args=(), kwargs={}, name=name or "ManualTask", on_finish=on_finish
         )
         # Register immediately so the creating task's stop cascades here.
         self._register_with_parent()
 
     def resolve(self, value: Any = None) -> None:
-        """Complete the promise successfully with *value*.
+        """Complete the task successfully with *value*.
 
-        Idempotent: a no-op if the promise is already resolved, failed, or
-        stopped. Otherwise wakes any waiters poll-free and fires finish
-        callbacks with ``(value, None)``. ``_finish`` is the single completion
-        gate, so the first of several racing completers wins.
+        Idempotent: a no-op if the task is already resolved, failed, or stopped.
+        Otherwise wakes any waiters poll-free and fires finish callbacks with
+        ``(value, None)``. ``_finish`` is the single completion gate, so the
+        first of several racing completers wins.
         """
         self._finish(result=value)
 
     def fail(self, exc: BaseException) -> None:
-        """Complete the promise with an exception.
+        """Complete the task with an exception.
 
-        Idempotent: a no-op if the promise is already done. Otherwise wakes any
+        Idempotent: a no-op if the task is already done. Otherwise wakes any
         waiters poll-free; ``wait()`` will re-raise *exc* and finish callbacks
         fire with ``(None, exc)``. ``_finish`` is the single completion gate, so
         the first of several racing completers wins.
@@ -1191,17 +1152,17 @@ class Promise(_TaskCore):
         self._finish(exc=exc)
 
     def stop(self, reason: str | None = None) -> None:
-        """Request stop, then complete the promise with ``Stopped``.
+        """Request stop, then complete the task with ``Stopped``.
 
-        A stopped promise has no body to raise ``Stopped``, so it must complete
-        itself or its waiters would hang forever. ``super().stop()`` runs first:
-        it sets the stop flag (recording *reason*), fires stop callbacks (so an
-        external producer can abort its side-effects), and cascades to children.
-        A stop callback may legitimately resolve or fail the promise; ``_finish``
-        is idempotent, so the injected ``Stopped`` is a no-op when the promise is
-        already complete and otherwise wins. The injected ``Stopped`` carries the
-        recorded reason so a stopped promise's waiters learn WHY. Idempotent via
-        ``super().stop()``'s own guard.
+        A stopped ManualTask has no body to raise ``Stopped``, so it must
+        complete itself or its waiters would hang forever. ``super().stop()``
+        runs first: it sets the stop flag (recording *reason*), fires stop
+        callbacks (so a producer can abort its side-effects), and cascades to
+        children. A stop callback may legitimately resolve or fail the task;
+        ``_finish`` is idempotent, so the injected ``Stopped`` is a no-op when
+        the task is already complete and otherwise wins. The injected
+        ``Stopped`` carries the recorded reason so a stopped task's waiters learn
+        WHY. Idempotent via ``super().stop()``'s own guard.
         """
         super().stop(reason)
         self._finish(exc=_stopped(self._stop_reason))
@@ -1210,7 +1171,7 @@ class Promise(_TaskCore):
         status = (
             "done" if self.is_done else ("stopped" if self.is_stopped else "pending")
         )
-        return f"<Promise {self._name!r} {status}>"
+        return f"<ManualTask {self._name!r} {status}>"
 
 
 # ---------------------------------------------------------------------------
@@ -1221,7 +1182,7 @@ class Promise(_TaskCore):
 class MultiTask(_TaskCore):
     """A bodyless Task that completes when ALL its child tasks complete.
 
-    Like ``Promise``, a MultiTask has no body and spawns no thread; it is driven
+    Like ``ManualTask``, a MultiTask has no body and spawns no thread; it is driven
     entirely by its children's finish callbacks. It aggregates several
     already-running tasks into one waitable unit: ``wait()`` blocks until every
     child has finished, then returns the list of child results (in task order)
@@ -1324,7 +1285,7 @@ class MultiTask(_TaskCore):
 
         Each child's own stop drives ``_child_finished``, which would normally
         complete the MultiTask. But a child that does not complete on stop must
-        not leave this task's waiters hanging, so — mirroring ``Promise.stop`` —
+        not leave this task's waiters hanging, so — mirroring ``ManualTask.stop`` —
         we self-complete with ``Stopped`` if still incomplete afterwards. The
         injected ``Stopped`` carries the recorded reason. Idempotent via
         ``super().stop()``'s own guard.
@@ -1353,6 +1314,34 @@ class MultiTask(_TaskCore):
 _WORKER_STOP = object()
 
 
+class _WorkerJob:
+    """A unit of work queued to a WorkerThread.
+
+    Pairs the ManualTask handed back to the submitter with the captured callable
+    and context snapshots the worker needs to run it. Keeping the body here —
+    rather than on the task — lets ``submit()`` return a plain ManualTask while
+    the worker retains everything required to complete it. The snapshots are
+    taken at submit time so the body inherits the submitter's stacks (narrative
+    throughline and task chain), not the worker's.
+    """
+
+    def __init__(
+        self,
+        task: "ManualTask",
+        fn: Callable[..., Any],
+        args: tuple,
+        kwargs: dict,
+        throughline_snapshot: SemanticSnapshot,
+        task_snapshot: SemanticSnapshot,
+    ) -> None:
+        self.task = task
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.throughline_snapshot = throughline_snapshot
+        self.task_snapshot = task_snapshot
+
+
 class WorkerThread:
     """Long-lived worker thread that serialises submitted jobs."""
 
@@ -1376,8 +1365,14 @@ class WorkerThread:
         kwargs: dict | None = None,
         *,
         name: str | None = None,
-    ) -> WorkTask:
-        """Enqueue *fn* and return a WorkTask immediately.
+    ) -> ManualTask:
+        """Enqueue *fn* and return a ManualTask immediately.
+
+        The worker completes the returned task when the job runs: it resolves
+        with *fn*'s return value or fails with its exception. Both the
+        throughline narrative and the task chain are snapshotted **at submit
+        time** and restored around the body, so the job inherits the context of
+        the code that submitted it, not the worker's.
 
         Raises RuntimeError if the worker has been stopped — a job submitted
         after stop() would sit behind the shutdown sentinel and never run,
@@ -1386,8 +1381,19 @@ class WorkerThread:
         with self._lock:
             if self._stopping:
                 raise RuntimeError(f"{self._name} is stopped; cannot submit new jobs")
-            task = WorkTask(fn, args, kwargs or {}, name=name)
-            self._queue.put(task)
+            # Default the task name to the callable's qualname so logs name the
+            # work, not the bare "ManualTask" placeholder.
+            job_name = name or getattr(fn, "__qualname__", repr(fn))
+            task = ManualTask(name=job_name)
+            job = _WorkerJob(
+                task,
+                fn,
+                tuple(args),
+                dict(kwargs or {}),
+                throughline.snapshot(),
+                _task_stack.snapshot(),
+            )
+            self._queue.put(job)
         return task
 
     def stop(self) -> None:
@@ -1410,13 +1416,36 @@ class WorkerThread:
             if item is _WORKER_STOP:
                 break
 
-            task: WorkTask = item
-            if task.is_stopped:
-                # Skip a job that was stopped before it ever ran.
-                task._finish(exc=_stopped(task._stop_reason))
+            job: _WorkerJob = item
+            task = job.task
+            if task.is_done:
+                # Resolved, failed, or stopped before it ran — nothing to do.
+                # A stop already self-completed the task with Stopped (see
+                # ManualTask.stop), so there is no body to run.
                 continue
 
-            task._execute()
+            # Restore the submitter's stacks, then run the body as this task.
+            # The captured callable's return value resolves the task; an
+            # exception fails it. If the task was stopped mid-run, _finish has
+            # already completed it with Stopped, so resolve()/fail() here is a
+            # no-op (the first completion wins).
+            with (
+                throughline.restore(job.throughline_snapshot),
+                _task_stack.restore(job.task_snapshot),
+            ):
+                with task_context(task, task._name):
+                    result = None
+                    exc: BaseException | None = None
+                    try:
+                        result = job.fn(*job.args, **job.kwargs)
+                    except BaseException as e:
+                        exc = e
+                    finally:
+                        task._stop_running_children()
+                        if exc is not None:
+                            task.fail(exc)
+                        else:
+                            task.resolve(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1431,8 +1460,7 @@ __all__ = [
     "throughline",
     "Task",
     "ThreadTask",
-    "WorkTask",
-    "Promise",
+    "ManualTask",
     "MultiTask",
     "WorkerThread",
     "asynch",

@@ -46,9 +46,10 @@ dependencies**.
 A **Task** is anything that satisfies the `Task` protocol — a unit of work that
 can report whether it is `is_done` / `is_stopped`, be `wait()`-ed on, and be
 asked to `stop()`. The built-in implementations are `ThreadTask` (runs a
-callable in its own daemon thread), `WorkTask` (one job queued to a long-lived
-`WorkerThread`), and `Promise` (no thread or body — completed externally by an
-already-existing producer).
+callable in its own daemon thread), `ManualTask` (no body of its own — completed
+manually via `resolve()` / `fail()`, by an already-existing producer or by a
+`WorkerThread` running a submitted job), and `MultiTask` (completes when all its
+children do).
 
 Tasks form a hierarchy automatically: when a task is created or waited on from
 *inside* another running task, it registers as a **child** of that task. Calling
@@ -93,10 +94,10 @@ The library keeps two `SemanticStack` singletons, each with one declared job:
 
 Task code enters both stacks at once through the `task_context(task, name)`
 helper. Context travels across thread boundaries automatically: `ThreadTask`
-copies the calling context with `contextvars.copy_context()`, while `WorkTask`
-*snapshots* both stacks at `submit()` time and restores them when the worker
-picks up the job — so a job inherits the context of the code that caused it to
-be submitted, not the worker's.
+copies the calling context with `contextvars.copy_context()`, while
+`WorkerThread.submit()` *snapshots* both stacks at submit time and restores them
+when the worker picks up the job — so a job inherits the context of the code that
+caused it to be submitted, not the worker's.
 
 ### `asynch` and `synch`
 
@@ -355,12 +356,14 @@ def parent_detaching():
     sleep(10)
 ```
 
-### `WorkerThread` and `WorkTask` — serialized jobs with inherited context
+### `WorkerThread` — serialized jobs with inherited context
 
 A `WorkerThread` is a long-lived thread that runs submitted jobs one at a time.
-`submit()` returns a `WorkTask` immediately and snapshots **both stacks at submit
-time**, so the job inherits the context of the code that caused it — not the
-worker's.
+`submit()` returns a `ManualTask` immediately and snapshots **both stacks at
+submit time**, so the job inherits the context of the code that caused it — not
+the worker's. The worker runs the submitted callable and `resolve()`s the task
+with its return value (or `fail()`s it with its exception); to the submitter it
+is just an externally-completed `ManualTask`.
 
 ```python
 from gentletask import WorkerThread, throughline, task_chain
@@ -390,22 +393,23 @@ worker.stop()          # already-queued jobs drain, then the thread shuts down
 After `stop()`, the worker drains any jobs already queued and then exits;
 further `submit()` calls raise `RuntimeError`.
 
-### `Promise` — an externally-completed task
+### `ManualTask` — a manually-completed task
 
-`ThreadTask` and `WorkTask` are *body-driven*: a callable runs and its return
-value (or exception) finishes the task. But many real results are *externally
-completed* — finished by a producer that already exists (a hardware monitor
-thread, a socket-reply reader, a GUI callback, a lock loop) rather than by a
-body of their own. Wrapping those in a `ThreadTask` would burn a useless parking
-thread per result. A `Promise` is the missing primitive: a `Task` with **no
-thread and no body**, completed externally via `resolve()` / `fail()`, that
-otherwise participates fully in the Task protocol and the stop hierarchy.
+`ThreadTask` is *body-driven*: a callable runs and its return value (or
+exception) finishes the task. But many real results are *manually completed* —
+finished by a producer that already exists (a hardware monitor thread, a
+socket-reply reader, a GUI callback, a lock loop) rather than by a body of their
+own. Wrapping those in a `ThreadTask` would burn a useless parking thread per
+result. A `ManualTask` is the missing primitive: a `Task` with **no body of its
+own**, completed via `resolve()` / `fail()`, that otherwise participates fully in
+the Task protocol and the stop hierarchy. (`WorkerThread` jobs are `ManualTask`s
+too — there the worker thread is the producer that completes them.)
 
 ```python
-from gentletask import Promise, ThreadTask
+from gentletask import ManualTask, ThreadTask
 
-# A producer hands out a Promise and finishes it later from wherever it runs.
-target_reached = Promise(name="target-reached")
+# A producer hands out a ManualTask and finishes it later from wherever it runs.
+target_reached = ManualTask(name="target-reached")
 
 def monitor():  # some already-running producer
     ...                            # watch the hardware
@@ -417,20 +421,20 @@ print(target_reached.wait())       # blocks poll-free until resolve() -> 123
 
 `resolve(value)` completes it successfully; `fail(exc)` completes it with an
 exception that `wait()` re-raises. Both are idempotent — the first completion
-wins and later calls are no-ops. A `Promise` created inside a running task
+wins and later calls are no-ops. A `ManualTask` created inside a running task
 registers as that task's child, so a parent `stop()` cascades to it; because a
-stopped promise has no body to raise `Stopped`, `stop()` fires its stop
-callbacks (letting the external producer abort its side-effects) and then
-completes the promise with `Stopped` so its waiters never hang. `stop(reason)`
-carries the reason into that injected `Stopped`.
+stopped task has no body to raise `Stopped`, `stop()` fires its stop callbacks
+(letting the producer abort its side-effects) and then completes the task with
+`Stopped` so its waiters never hang. `stop(reason)` carries the reason into that
+injected `Stopped`.
 
 ### `MultiTask` — aggregate several running tasks into one
 
 Sometimes you have several tasks already running and want to treat them as a
 single waitable unit: block until they have **all** finished, collect their
 results, surface their errors together, and stop them as a group. `MultiTask` is
-that aggregator. Like `Promise` it is **bodyless and threadless** — it spawns no
-thread, and is driven entirely by its children's finish callbacks.
+that aggregator. Like `ManualTask` it is **bodyless and threadless** — it spawns
+no thread, and is driven entirely by its children's finish callbacks.
 
 ```python
 from gentletask import MultiTask, ThreadTask
@@ -607,9 +611,9 @@ The rule of thumb:
 
 In short: **`gentletask` primitives for interruptible work; `threading`
 primitives for the scaffolding that makes a task a task.** The built-in
-`ThreadTask` and `WorkTask` follow exactly this split internally — their
-done/stop signaling is `threading`-based, while the work you hand them is free
-to use the stop-aware primitives.
+`ThreadTask` and the `WorkerThread` jobs follow exactly this split internally —
+their done/stop signaling is `threading`-based, while the work you hand them is
+free to use the stop-aware primitives.
 
 ---
 
@@ -629,10 +633,9 @@ to use the stop-aware primitives.
 | --- | --- |
 | `Task` | `runtime_checkable` structural `Protocol` for a stoppable, waitable unit of work. |
 | `ThreadTask(fn, args=(), kwargs=None, *, name=None, detach=False, on_finish=None, start=True)` | Runs `fn` in a new daemon thread; implements `Task`. With `start=False`, call `.start()` to launch (idempotent). |
-| `WorkTask(fn, args, kwargs, name=None)` | One job queued to a `WorkerThread`; implements `Task`. Usually created via `WorkerThread.submit`. |
-| `Promise(name=None, *, on_finish=None)` | A `Task` with no thread or body, completed externally via `resolve(value)` / `fail(exc)`; implements `Task`. Idempotent completion; `stop(reason=None)` completes it with `Stopped` carrying the reason. |
+| `ManualTask(name=None, *, on_finish=None)` | A `Task` with no body of its own, completed manually via `resolve(value)` / `fail(exc)`; implements `Task`. Idempotent completion; `stop(reason=None)` completes it with `Stopped` carrying the reason. Also the task type `WorkerThread.submit` returns. |
 | `MultiTask(tasks, name=None, *, on_finish=None)` | A bodyless, threadless `Task` that completes when ALL its child `tasks` complete; implements `Task`. `wait()` returns the list of child results in task order, re-raises a lone child failure, or raises `MultiException` for two or more. `stop(reason=None)` stops every child then completes with `Stopped`. `tasks` exposes the children. |
-| `WorkerThread(name=None)` | Long-lived worker thread that serializes submitted jobs. `submit(...)` returns a `WorkTask`; `stop()` drains queued jobs and shuts down. |
+| `WorkerThread(name=None)` | Long-lived worker thread that serializes submitted jobs. `submit(...)` returns a `ManualTask` the worker completes by running the job; `stop()` drains queued jobs and shuts down. |
 | `asynch(fn, name=None, detach=False, on_finish=None)` | Returns a launcher that starts `fn` in a new `ThreadTask` when called. |
 | `synch(fn)` | Returns a synchronous version of `fn` that de-wraps `asynch` and awaits returned tasks, yielding a concrete value. |
 
