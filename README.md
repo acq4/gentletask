@@ -620,6 +620,7 @@ to use the stop-aware primitives.
 | Name | Description |
 | --- | --- |
 | `Stopped` | Raised inside a task when `stop()` has been requested. Carries the optional `reason` passed to `stop()` as its message (`str(Stopped("foo")) == "foo"`; a reason-less `Stopped()` is empty). Unwinds normally; `finally` blocks run. |
+| `task.Timeout` | Per-task exception raised by *that task's* `wait(timeout=...)` when the deadline elapses — `wait()` never *returns* to signal a timeout, so a returned `None` unambiguously means the task finished with a `None` result. `except some_task.Timeout` catches only *that* task's deadline — never a timeout that propagated up from an inner `wait` as the task's result (the raised instance carries `.task`). It subclasses the builtin `TimeoutError`, which is the general catch-all (`except TimeoutError`) when you don't have, or don't care about, the specific task. A parent-stop raises `Stopped` instead, so a bounded `wait()`'s failure modes are never confused. |
 | `MultiException(message, exceptions)` | Aggregate raised by `MultiTask.wait()` when more than one child failed. `.exceptions` holds the child exceptions in task order; the message combines `message` with each child's string form. |
 
 ### Tasks
@@ -643,7 +644,7 @@ to use the stop-aware primitives.
 | `is_stopped: bool` | Whether a stop has been requested. |
 | `stop_reason` | Property; the `reason` passed to the first `stop()`, or `None` for a reason-less stop. |
 | `result` | Property; shorthand for `wait()`. |
-| `wait(timeout=None)` | Block until done, re-raising any worker exception. A stop on the calling parent propagates here and raises `Stopped` carrying the parent's reason. |
+| `wait(timeout=None)` | Block until done, re-raising any worker exception. A stop on the calling parent propagates here and raises `Stopped` carrying the parent's reason. With a `timeout`, raises `self.Timeout` (catch `task.Timeout`, or the builtin `TimeoutError` for a broader catch) if the task is not done by the deadline — never returns to signal it, so a returned `None` means the task finished. `timeout=None` waits forever; `result` uses no timeout, so it never times out. |
 | `stop(reason=None)` | Request cooperative stop; record `reason` (first stop only); fire stop callbacks once; cascade to children (passing the reason along). |
 | `add_finish_callback(fn)` | Call `fn(result, exception)` when the task finishes (immediately if already finished). |
 | `add_stop_callback(fn)` | Call zero-arg `fn()` once when the task is stopped (immediately if already stopped). |

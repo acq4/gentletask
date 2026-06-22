@@ -309,7 +309,11 @@ subsequent `parent.stop()` will not cascade here.
 called from inside another task, `wait` registers a stop callback on that parent
 so a `parent.stop()` wakes the wait immediately; it then calls
 `self.stop(parent.stop_reason)` and raises `Stopped` carrying the parent's
-reason.
+reason. With a `timeout`, a deadline that elapses before the task is done raises
+`self.Timeout` (see below) — `wait` never *returns* to signal a timeout, so a
+returned value (including `None`) always means the task finished. `timeout=None`
+waits forever and never times out; `timeout=0` raises immediately unless already
+done. The `result` property waits without a timeout, so it never times out.
 
 **`__del__` cleanup.** A `ThreadTask` garbage-collected before `wait()` is
 called automatically calls `stop()` on itself and its children.
@@ -545,6 +549,22 @@ the optional `reason` passed to `stop()` as its message, so `str(Stopped("foo"))
 stopped current task — `check_stop`, `sleep`, `Queue.get`, `Event.wait`, `poll`
 (via `check_stop`), and `Task.wait`'s parent-cascade — supplies that task's
 `stop_reason`. Unwind normally; finally blocks run.
+
+**`task.Timeout`.** Each task raises its *own* timeout exception, reachable as
+`task.Timeout` (a subclass of the builtin `TimeoutError`, built lazily and
+cached). `wait(timeout=...)` raises `self.Timeout` when the deadline elapses
+before the task is done — and *raises*, never returns, so a `None` return from
+`wait()` unambiguously means the task finished with a `None` result. `except
+task.Timeout` catches only *that* task's deadline — not a timeout that escaped
+an inner `wait` and propagated up as the task's result. Without per-task
+classes, a retry loop guarding on a shared timeout type around
+`outer.wait(timeout=...)` would mistake an inner task's propagated timeout for
+its own deadline and spin forever. For a broader catch (any wait deadline, or an
+OS-level timeout), callers fall back to the builtin `TimeoutError`, which every
+`task.Timeout` subclasses; there is no public module-level timeout type. The
+raised instance carries `.task`, the task whose wait elapsed. A parent-stop
+wakes `wait()` with `Stopped` instead, so a bounded `wait()`'s failure modes —
+deadline vs. stop — are never confused.
 
 **`sleep(seconds)`.** Drop-in for `time.sleep`. Blocks on the stop signal
 itself, so a stop unblocks it immediately (raising `Stopped`); otherwise it

@@ -514,12 +514,12 @@ class TestThreadTask:
         t.add_finish_callback(lambda r, e: results.append(r))
         assert results == [3]
 
-    def test_wait_timeout_returns_none(self):
+    def test_wait_timeout_raises(self):
         barrier = threading.Event()
         t = ThreadTask(barrier.wait)
-        result = t.wait(timeout=0.05)
+        with pytest.raises(t.Timeout):
+            t.wait(timeout=0.05)
         barrier.set()
-        assert result is None
 
     def test_stop_before_run_marks_stopped(self):
         barrier = threading.Barrier(2)
@@ -621,8 +621,9 @@ class TestThreadTaskDeferredStart:
 
     def test_wait_on_unstarted_times_out(self):
         t = ThreadTask(lambda: 1, start=False)
-        # Not started, so it never completes; wait should time out -> None.
-        assert t.wait(timeout=0.1) is None
+        # Not started, so it never completes; wait should time out -> raise.
+        with pytest.raises(t.Timeout):
+            t.wait(timeout=0.1)
         assert not t.is_done
         t.start()
         assert t.wait(timeout=1.0) == 1
@@ -1466,9 +1467,73 @@ class TestWaitSemantics:
             return 99
 
         t = ThreadTask(fn)
-        assert t.wait(timeout=0.05) is None  # not done yet
+        with pytest.raises(t.Timeout):
+            t.wait(timeout=0.05)  # not done yet
         release.set()
         assert t.wait(timeout=1.0) == 99  # re-waited to completion
+
+    def test_timeout_is_a_timeouterror(self):
+        # A task's Timeout subclasses the builtin TimeoutError, so callers may
+        # catch either the precise per-task type or the idiomatic builtin.
+        barrier = threading.Event()
+        t = ThreadTask(barrier.wait)
+        assert issubclass(t.Timeout, TimeoutError)
+        with pytest.raises(TimeoutError):
+            t.wait(timeout=0.05)
+        barrier.set()
+
+    def test_none_result_returns_none_not_timeout(self):
+        # A task that legitimately resolves to None returns None from wait();
+        # this is now unambiguous because a timeout raises instead.
+        t = ThreadTask(lambda: None)
+        assert t.wait(timeout=1.0) is None
+        assert t.is_done
+
+    def test_own_timeout_caught_by_per_task_class(self):
+        # A task's own wait deadline raises that task's .Timeout subclass.
+        barrier = threading.Event()
+        t = ThreadTask(barrier.wait, name="slow")
+        with pytest.raises(t.Timeout):
+            t.wait(timeout=0.05)
+        barrier.set()
+
+    def test_per_task_timeout_classes_are_distinct(self):
+        a = ThreadTask(lambda: None)
+        b = ThreadTask(lambda: None)
+        a.wait()
+        b.wait()
+        assert a.Timeout is a.Timeout  # stable per instance
+        assert a.Timeout is not b.Timeout
+        assert issubclass(a.Timeout, TimeoutError)
+        assert issubclass(b.Timeout, TimeoutError)
+        assert not issubclass(a.Timeout, b.Timeout)
+
+    def test_inner_timeout_does_not_satisfy_outer_per_task_class(self):
+        # The motivating case: a Timeout escaping an inner wait propagates as
+        # the OUTER task's failure. The outer task's own .Timeout must NOT catch
+        # it, so a retry loop guarding on `task2.Timeout` surfaces the real
+        # failure instead of spinning forever.
+        inner_holder = {}
+
+        def fn1():
+            sleep(100)
+
+        def fn2():
+            inner = asynch(fn1, name="inner")()
+            inner_holder["inner"] = inner
+            inner.wait(timeout=0.05)  # raises inner.Timeout, uncaught here
+
+        task2 = asynch(fn2, name="outer")()
+        try:
+            with pytest.raises(TimeoutError) as info:
+                task2.wait(timeout=2.0)
+            inner = inner_holder["inner"]
+            # task2 completed by failing with the INNER task's Timeout.
+            assert isinstance(info.value, inner.Timeout)
+            assert not isinstance(info.value, task2.Timeout)
+            assert info.value.task is inner
+        finally:
+            inner_holder["inner"].stop()  # let the sleep(100) thread unwind
 
     def test_result_reraises_on_each_access(self):
         def boom():
