@@ -29,6 +29,7 @@ from gentletask import (
     check_stop,
     current_task,
     poll,
+    raise_errors,
     sleep,
     synch,
     task_chain,
@@ -756,6 +757,160 @@ class TestAsynch:
         asynch(lambda: 1, on_finish=lambda r, e: done.append(r))()
         time.sleep(0.1)
         assert done == [1]
+
+
+# ---------------------------------------------------------------------------
+# raise_errors — loud failure surfacing for fire-and-forget tasks
+# ---------------------------------------------------------------------------
+
+
+class TestRaiseErrors:
+    """Tests for raise_errors() and the raise_errors= flag on asynch/ThreadTask/detach."""
+
+    @staticmethod
+    def _capture_hook():
+        """Context manager that captures threading.excepthook calls.
+
+        Yields (errors_list, ready_event): ready_event is set when the hook
+        fires for the first time, so tests can block on it instead of sleeping.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def ctx():
+            errors = []
+            fired = threading.Event()
+            orig = threading.excepthook
+
+            def hook(args):
+                errors.append(args.exc_value)
+                fired.set()
+
+            threading.excepthook = hook
+            try:
+                yield errors, fired
+            finally:
+                threading.excepthook = orig
+
+        return ctx()
+
+    def test_failure_surfaces_as_runtime_error(self):
+        def failing():
+            raise ValueError("boom")
+
+        with self._capture_hook() as (errors, fired):
+            t = ThreadTask(failing)
+            raise_errors(t)
+            assert fired.wait(timeout=1.0), "error hook was not called"
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert "boom" in str(errors[0].__cause__)
+
+    def test_stopped_is_not_an_error(self):
+        done = threading.Event()
+
+        with self._capture_hook() as (errors, fired):
+            t = ThreadTask(lambda: sleep(10), on_finish=lambda r, e: done.set())
+            raise_errors(t)
+            t.stop()
+            done.wait(timeout=1.0)
+            time.sleep(0.05)  # give monitor thread a chance to fire if it were going to
+
+        assert errors == []
+
+    def test_message_contains_task_name_and_error(self):
+        def failing():
+            raise ValueError("detail")
+
+        with self._capture_hook() as (errors, fired):
+            t = ThreadTask(failing, name="my-task")
+            raise_errors(t, message="task {name!r} blew up: {error}")
+            assert fired.wait(timeout=1.0)
+
+        assert "my-task" in str(errors[0])
+        assert "detail" in str(errors[0])
+
+    def test_message_stack_placeholder(self):
+        def failing():
+            raise ValueError("x")
+
+        with self._capture_hook() as (errors, fired):
+            t = ThreadTask(failing)
+            raise_errors(t, message="err: {error} stack: {stack}")
+            assert fired.wait(timeout=1.0)
+
+        assert "stack:" in str(errors[0])
+        assert "test_message_stack_placeholder" in str(errors[0])
+
+    def test_thread_task_raise_errors_kwarg(self):
+        def failing():
+            raise ValueError("kwarg-path")
+
+        with self._capture_hook() as (errors, fired):
+            ThreadTask(failing, raise_errors=True)
+            assert fired.wait(timeout=1.0)
+
+        assert isinstance(errors[0], RuntimeError)
+        assert "kwarg-path" in str(errors[0].__cause__)
+
+    def test_thread_task_raise_errors_kwarg_stopped_is_silent(self):
+        done = threading.Event()
+
+        with self._capture_hook() as (errors, fired):
+            t = ThreadTask(lambda: sleep(10), raise_errors=True, on_finish=lambda r, e: done.set())
+            t.stop()
+            done.wait(timeout=1.0)
+            time.sleep(0.05)
+
+        assert errors == []
+
+    def test_asynch_raise_errors_kwarg(self):
+        def failing(x):
+            raise ValueError(f"asynch-{x}")
+
+        with self._capture_hook() as (errors, fired):
+            launcher = asynch(failing, raise_errors=True)
+            launcher(42)
+            assert fired.wait(timeout=1.0)
+
+        assert "asynch-42" in str(errors[0].__cause__)
+
+    def test_detach_raise_errors(self):
+        def failing():
+            raise ValueError("detach-err")
+
+        with self._capture_hook() as (errors, fired):
+            def parent_fn():
+                child = ThreadTask(failing)
+                child.detach(raise_errors=True)
+                sleep(10)
+
+            parent = ThreadTask(parent_fn)
+            assert fired.wait(timeout=1.0)
+            parent.stop()
+            with pytest.raises(Stopped):
+                parent.wait(timeout=1.0)
+
+        assert isinstance(errors[0], RuntimeError)
+        assert "detach-err" in str(errors[0].__cause__)
+
+    def test_detach_raise_errors_stopped_is_silent(self):
+        done = threading.Event()
+
+        with self._capture_hook() as (errors, fired):
+            def parent_fn():
+                child = ThreadTask(lambda: sleep(10), on_finish=lambda r, e: done.set())
+                child.detach(raise_errors=True)
+                sleep(10)
+
+            parent = ThreadTask(parent_fn)
+            time.sleep(0.02)
+            parent.stop()
+            # child is detached so must be stopped explicitly
+            time.sleep(0.1)
+
+        assert errors == []
 
 
 # ---------------------------------------------------------------------------

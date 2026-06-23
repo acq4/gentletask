@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is in `0.x`, the public API is not yet frozen: breaking
 changes bump the minor version and are called out under **Migration** below.
 
+## [0.6.0] - 2026-06-23
+
+### Added
+
+- **`raise_errors(task, message=...)`** — a lightweight helper that installs a
+  daemon thread watching *task* and re-raises any failure (excluding `Stopped`)
+  through the process's unhandled-exception hook, so fire-and-forget tasks
+  never silently discard errors. *message* is a format string supporting
+  `{name}` (task name), `{error}` (exception string), and `{stack}` (caller
+  traceback at the time `raise_errors` was called).
+- **`raise_errors=False` parameter on `ThreadTask.__init__`** — setting it to
+  `True` is equivalent to calling `raise_errors(task)` immediately after
+  construction. Useful for `ThreadTask(fn, detach=True, raise_errors=True)`.
+- **`raise_errors=False` parameter on `asynch()`** — propagated to every
+  `ThreadTask` the launcher creates, so fire-and-forget lambdas surface errors
+  with one flag at the declaration site.
+- **`raise_errors=False` parameter on `_TaskCore.detach()`** — detaches the
+  task from the stop cascade and installs the error surface in one call:
+  `child.detach(raise_errors=True)`.
+
 ## [0.5.0] - 2026-06-22
 
 ### Changed

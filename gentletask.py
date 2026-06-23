@@ -12,10 +12,11 @@ import logging
 import queue as _queue
 import threading
 import time
+import traceback
 import weakref
 from typing import Any, Callable, Iterable, Iterator, Protocol, runtime_checkable
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 _logger = logging.getLogger(__name__)
 
@@ -322,7 +323,7 @@ class Task(Protocol):
     ) -> None: ...
     def add_stop_callback(self, fn: Callable[[], Any]) -> None: ...
     def remove_stop_callback(self, fn: Callable[[], Any]) -> None: ...
-    def detach(self) -> None: ...
+    def detach(self, raise_errors: bool = False) -> None: ...
 
 
 @contextlib.contextmanager
@@ -854,7 +855,7 @@ class _TaskCore:
             except ValueError:
                 pass
 
-    def detach(self) -> None:
+    def detach(self, raise_errors: bool = False) -> None:
         """Remove this task from the calling parent's stop propagation.
 
         Only a parent may detach one of its own children: the caller's
@@ -867,6 +868,11 @@ class _TaskCore:
         Detaching does not touch the throughline. A detached task keeps its
         narrative ancestry, so logs can still say its work was started in
         service of the operation that spawned it.
+
+        With ``raise_errors=True`` any exception from this task (other than
+        ``Stopped``) is re-raised loudly on a background daemon thread so it
+        surfaces through the process's unhandled-exception hook rather than
+        being silently discarded.
         """
         parent = current_task()
         if (
@@ -880,6 +886,8 @@ class _TaskCore:
             )
         self._detach = True
         parent._children.discard(self)
+        if raise_errors:
+            _raise_errors_impl(self)
 
     # -- internals -----------------------------------------------------------
 
@@ -943,6 +951,7 @@ class ThreadTask(_TaskCore):
         *,
         name: str | None = None,
         detach: bool = False,
+        raise_errors: bool = False,
         on_finish: Callable[[Any, BaseException | None], Any] | None = None,
         start: bool = True,
     ) -> None:
@@ -979,6 +988,8 @@ class ThreadTask(_TaskCore):
         )
         if start:
             self.start()
+        if raise_errors:
+            _raise_errors_impl(self)
 
     def start(self) -> None:
         """Launch the daemon thread. Idempotent — extra calls are a no-op.
@@ -1027,6 +1038,7 @@ def asynch(
     fn: Callable,
     name: str | None = None,
     detach: bool = False,
+    raise_errors: bool = False,
     on_finish: Callable[[Any, BaseException | None], Any] | None = None,
 ) -> Callable[..., ThreadTask]:
     """Return a callable that starts *fn* in a new ThreadTask when called.
@@ -1038,12 +1050,56 @@ def asynch(
 
     def wrapper(*args: Any, **kwargs: Any) -> ThreadTask:
         return ThreadTask(
-            fn, args, kwargs, name=name, detach=detach, on_finish=on_finish
+            fn, args, kwargs, name=name, detach=detach, raise_errors=raise_errors, on_finish=on_finish
         )
 
     # Record the original callable so synch() can de-wrap back to it.
     wrapper._asynch_wraps = fn
     return wrapper
+
+
+def raise_errors(
+    task: Task,
+    message: str = "background task {name!r} failed: {error}",
+) -> None:
+    """Surface a discarded task's failure loudly from a daemon thread.
+
+    Spawns a lightweight daemon thread that waits on *task* and, if the task
+    fails with anything other than ``Stopped``, re-raises the error on that
+    thread so the process's unhandled-exception hook reports it.
+
+    *message* is a format string supporting the keys ``{name}`` (the task's
+    name), ``{error}`` (the exception's string form), and ``{stack}`` (the
+    caller's traceback at the time ``raise_errors`` was called).
+
+    The monitor thread sets ``_waited`` on the task, which prevents
+    ``ThreadTask.__del__`` from stopping a detached task before it finishes.
+    """
+    _raise_errors_impl(task, message)
+
+
+def _raise_errors_impl(
+    task: Task,
+    message: str = "background task {name!r} failed: {error}",
+) -> None:
+    """Internal implementation shared by raise_errors() and the detach/asynch flags."""
+    caller_stack = "".join(traceback.format_stack()[:-1])
+    task_name = getattr(task, "_name", repr(task))
+
+    def _monitor() -> None:
+        try:
+            task.wait()
+        except Stopped:
+            return
+        except BaseException as exc:
+            msg = message.format(name=task_name, error=str(exc), stack=caller_stack)
+            raise RuntimeError(msg) from exc
+
+    threading.Thread(
+        target=_monitor,
+        daemon=True,
+        name=f"error-monitor({task_name})",
+    ).start()
 
 
 def synch(fn: Callable) -> Callable:
@@ -1465,6 +1521,7 @@ __all__ = [
     "WorkerThread",
     "asynch",
     "synch",
+    "raise_errors",
     "task_context",
     "current_task",
     "task_chain",

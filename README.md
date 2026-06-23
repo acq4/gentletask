@@ -294,6 +294,10 @@ def schedule(x):                      # a function that hands back a task
 print(synch(schedule)(5))             # 50 — synch waits for the returned task
 ```
 
+Both `asynch` and `ThreadTask` accept `raise_errors=True` (default `False`) to
+surface failures loudly even when the caller never calls `.wait()`. See
+[`raise_errors`](#raise_errors--surfacing-fire-and-forget-failures) below.
+
 ### Cooperative stop and stop-aware primitives
 
 `sleep`, `check_stop`, `poll`, `Queue.get`, and `Event.wait` all check
@@ -355,6 +359,51 @@ def parent_detaching():
     c.detach()                # parent.stop() will NOT reach this child
     sleep(10)
 ```
+
+`detach()` accepts `raise_errors=True` to register an error surface at the same
+time:
+
+```python
+def parent_fn():
+    c = ThreadTask(some_work)
+    c.detach(raise_errors=True)   # detached AND errors surfaced loudly
+    sleep(10)
+```
+
+### `raise_errors` — surfacing fire-and-forget failures
+
+When a task is fire-and-forgotten (detached, or simply never `.wait()`-ed), any
+exception it raises is silently discarded. `raise_errors` installs a lightweight
+daemon thread that watches the task and re-raises any failure (excluding
+`Stopped`) through the process's unhandled-exception hook, so it is never
+silently lost.
+
+```python
+from gentletask import raise_errors, ThreadTask, asynch
+
+# Standalone helper — pass any task:
+monitored = ThreadTask(some_work)
+raise_errors(monitored)
+
+# Keyword argument on ThreadTask — equivalent, one fewer line:
+ThreadTask(some_work, raise_errors=True)
+
+# Keyword argument on asynch:
+fire_and_forget = asynch(some_work, detach=True, raise_errors=True)
+fire_and_forget()   # errors surface even though we never call .wait()
+```
+
+`raise_errors(task, message=...)` accepts an optional format string with three
+placeholders:
+
+| Placeholder | Meaning |
+|---|---|
+| `{name}` | The task's name |
+| `{error}` | The exception's string form |
+| `{stack}` | The call stack at the time `raise_errors` was called |
+
+A deliberate `Stopped` (the result of calling `stop()`) is never treated as an
+error — it is silently swallowed, as intended.
 
 ### `WorkerThread` — serialized jobs with inherited context
 
