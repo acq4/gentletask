@@ -843,22 +843,40 @@ class TestRaiseErrors:
         assert "stack:" in str(errors[0])
         assert "test_message_stack_placeholder" in str(errors[0])
 
-    def test_thread_task_raise_errors_kwarg(self):
+    def test_thread_task_raise_errors_string(self):
         def failing():
             raise ValueError("kwarg-path")
 
         with self._capture_hook() as (errors, fired):
-            ThreadTask(failing, raise_errors=True)
+            ThreadTask(failing, name="sensor", raise_errors="sensor {name!r}: {error}")
             assert fired.wait(timeout=1.0)
 
         assert isinstance(errors[0], RuntimeError)
-        assert "kwarg-path" in str(errors[0].__cause__)
+        assert "sensor 'sensor'" in str(errors[0])
+        assert "kwarg-path" in str(errors[0])
 
-    def test_thread_task_raise_errors_kwarg_stopped_is_silent(self):
+    def test_thread_task_raise_errors_false_disables(self):
         done = threading.Event()
 
         with self._capture_hook() as (errors, fired):
-            t = ThreadTask(lambda: sleep(10), raise_errors=True, on_finish=lambda r, e: done.set())
+            def failing():
+                raise ValueError("should-not-surface")
+
+            t = ThreadTask(failing, raise_errors=False, on_finish=lambda r, e: done.set())
+            done.wait(timeout=1.0)
+            time.sleep(0.05)
+
+        assert errors == []
+
+    def test_thread_task_raise_errors_stopped_is_silent(self):
+        done = threading.Event()
+
+        with self._capture_hook() as (errors, fired):
+            t = ThreadTask(
+                lambda: sleep(10),
+                raise_errors="task {name!r} failed: {error}",
+                on_finish=lambda r, e: done.set(),
+            )
             t.stop()
             done.wait(timeout=1.0)
             time.sleep(0.05)
@@ -870,7 +888,7 @@ class TestRaiseErrors:
             raise ValueError(f"asynch-{x}")
 
         with self._capture_hook() as (errors, fired):
-            launcher = asynch(failing, raise_errors=True)
+            launcher = asynch(failing, raise_errors="job failed: {error}")
             launcher(42)
             assert fired.wait(timeout=1.0)
 
@@ -883,7 +901,7 @@ class TestRaiseErrors:
         with self._capture_hook() as (errors, fired):
             def parent_fn():
                 child = ThreadTask(failing)
-                child.detach(raise_errors=True)
+                child.detach(raise_errors="child {name!r} died: {error}")
                 sleep(10)
 
             parent = ThreadTask(parent_fn)
@@ -901,7 +919,7 @@ class TestRaiseErrors:
         with self._capture_hook() as (errors, fired):
             def parent_fn():
                 child = ThreadTask(lambda: sleep(10), on_finish=lambda r, e: done.set())
-                child.detach(raise_errors=True)
+                child.detach(raise_errors="child failed: {error}")
                 sleep(10)
 
             parent = ThreadTask(parent_fn)

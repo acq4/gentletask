@@ -323,7 +323,7 @@ class Task(Protocol):
     ) -> None: ...
     def add_stop_callback(self, fn: Callable[[], Any]) -> None: ...
     def remove_stop_callback(self, fn: Callable[[], Any]) -> None: ...
-    def detach(self, raise_errors: bool = False) -> None: ...
+    def detach(self, raise_errors: bool | str = False) -> None: ...
 
 
 @contextlib.contextmanager
@@ -855,7 +855,7 @@ class _TaskCore:
             except ValueError:
                 pass
 
-    def detach(self, raise_errors: bool = False) -> None:
+    def detach(self, raise_errors: bool | str = False) -> None:
         """Remove this task from the calling parent's stop propagation.
 
         Only a parent may detach one of its own children: the caller's
@@ -887,7 +887,7 @@ class _TaskCore:
         self._detach = True
         parent._children.discard(self)
         if raise_errors:
-            _raise_errors_impl(self)
+            _raise_errors_impl(self, raise_errors if isinstance(raise_errors, str) else _RAISE_ERRORS_DEFAULT_MSG)
 
     # -- internals -----------------------------------------------------------
 
@@ -951,7 +951,7 @@ class ThreadTask(_TaskCore):
         *,
         name: str | None = None,
         detach: bool = False,
-        raise_errors: bool = False,
+        raise_errors: bool | str = False,
         on_finish: Callable[[Any, BaseException | None], Any] | None = None,
         start: bool = True,
     ) -> None:
@@ -989,7 +989,7 @@ class ThreadTask(_TaskCore):
         if start:
             self.start()
         if raise_errors:
-            _raise_errors_impl(self)
+            _raise_errors_impl(self, raise_errors if isinstance(raise_errors, str) else _RAISE_ERRORS_DEFAULT_MSG)
 
     def start(self) -> None:
         """Launch the daemon thread. Idempotent — extra calls are a no-op.
@@ -1038,7 +1038,7 @@ def asynch(
     fn: Callable,
     name: str | None = None,
     detach: bool = False,
-    raise_errors: bool = False,
+    raise_errors: bool | str = False,
     on_finish: Callable[[Any, BaseException | None], Any] | None = None,
 ) -> Callable[..., ThreadTask]:
     """Return a callable that starts *fn* in a new ThreadTask when called.
@@ -1058,9 +1058,12 @@ def asynch(
     return wrapper
 
 
+_RAISE_ERRORS_DEFAULT_MSG = "background task {name!r} failed: {error}"
+
+
 def raise_errors(
     task: Task,
-    message: str = "background task {name!r} failed: {error}",
+    message: str = _RAISE_ERRORS_DEFAULT_MSG,
 ) -> None:
     """Surface a discarded task's failure loudly from a daemon thread.
 
@@ -1080,7 +1083,7 @@ def raise_errors(
 
 def _raise_errors_impl(
     task: Task,
-    message: str = "background task {name!r} failed: {error}",
+    message: str = _RAISE_ERRORS_DEFAULT_MSG,
 ) -> None:
     """Internal implementation shared by raise_errors() and the detach/asynch flags."""
     caller_stack = "".join(traceback.format_stack()[:-1])

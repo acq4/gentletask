@@ -17,15 +17,21 @@ changes bump the minor version and are called out under **Migration** below.
   never silently discard errors. *message* is a format string supporting
   `{name}` (task name), `{error}` (exception string), and `{stack}` (caller
   traceback at the time `raise_errors` was called).
-- **`raise_errors=False` parameter on `ThreadTask.__init__`** — setting it to
-  `True` is equivalent to calling `raise_errors(task)` immediately after
-  construction. Useful for `ThreadTask(fn, detach=True, raise_errors=True)`.
-- **`raise_errors=False` parameter on `asynch()`** — propagated to every
-  `ThreadTask` the launcher creates, so fire-and-forget lambdas surface errors
-  with one flag at the declaration site.
-- **`raise_errors=False` parameter on `_TaskCore.detach()`** — detaches the
-  task from the stop cascade and installs the error surface in one call:
-  `child.detach(raise_errors=True)`.
+- **`raise_errors=False` parameter on `ThreadTask.__init__`, `asynch()`, and
+  `detach()`** — accepts `False` (off, default) or a message string. Passing a
+  string enables error surfacing with that message; `False` disables it.
+  `child.detach(raise_errors="sensor {name!r} died: {error}")` detaches and
+  installs the monitor in one call.
+
+### Fixed
+
+- `ThroughlineNameFilter` now walks the exception cause chain (`__cause__` →
+  `__context__`, respecting `__suppress_context__`) when resolving the
+  raise-site throughline. Previously, a wrapper exception raised with `raise W
+  from original` carried no tag of its own, so the original's raise-site chain
+  was silently dropped and the log record fell back to the (typically empty)
+  chain active at the logging call. The fix mirrors how Python's own traceback
+  printer traverses the exception chain.
 
 ## [0.5.0] - 2026-06-22
 

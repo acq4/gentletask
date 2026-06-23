@@ -294,8 +294,9 @@ def schedule(x):                      # a function that hands back a task
 print(synch(schedule)(5))             # 50 — synch waits for the returned task
 ```
 
-Both `asynch` and `ThreadTask` accept `raise_errors=True` (default `False`) to
-surface failures loudly even when the caller never calls `.wait()`. See
+Both `asynch` and `ThreadTask` accept a `raise_errors` argument (default
+`False`) to surface failures loudly even when the caller never calls `.wait()`.
+Pass a format string as the message, or `False` to disable. See
 [`raise_errors`](#raise_errors--surfacing-fire-and-forget-failures) below.
 
 ### Cooperative stop and stop-aware primitives
@@ -360,13 +361,13 @@ def parent_detaching():
     sleep(10)
 ```
 
-`detach()` accepts `raise_errors=True` to register an error surface at the same
-time:
+`detach()` accepts a `raise_errors` message string to register an error surface
+at the same time:
 
 ```python
 def parent_fn():
-    c = ThreadTask(some_work)
-    c.detach(raise_errors=True)   # detached AND errors surfaced loudly
+    c = ThreadTask(some_work, name="sensor")
+    c.detach(raise_errors="sensor {name!r} died: {error}")   # detached AND errors surfaced
     sleep(10)
 ```
 
@@ -385,11 +386,11 @@ from gentletask import raise_errors, ThreadTask, asynch
 monitored = ThreadTask(some_work)
 raise_errors(monitored)
 
-# Keyword argument on ThreadTask — equivalent, one fewer line:
-ThreadTask(some_work, raise_errors=True)
+# Keyword argument on ThreadTask — pass a message string:
+ThreadTask(some_work, raise_errors="task {name!r} failed: {error}")
 
 # Keyword argument on asynch:
-fire_and_forget = asynch(some_work, detach=True, raise_errors=True)
+fire_and_forget = asynch(some_work, detach=True, raise_errors="{name!r}: {error}")
 fire_and_forget()   # errors surface even though we never call .wait()
 ```
 
