@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is in `0.x`, the public API is not yet frozen: breaking
 changes bump the minor version and are called out under **Migration** below.
 
+## [Unreleased]
+
+### Fixed
+
+- `ThroughlineNameFilter` now walks the exception cause chain (`__cause__` →
+  `__context__`, respecting `__suppress_context__`) when resolving the
+  raise-site throughline. Previously, a wrapper exception raised with `raise W
+  from original` carried no tag of its own, so the original's raise-site chain
+  was silently dropped and the log record fell back to the (typically empty)
+  chain active at the logging call. The fix mirrors how Python's own traceback
+  printer traverses the exception chain.
+
 ## [0.5.0] - 2026-06-22
 
 ### Changed
