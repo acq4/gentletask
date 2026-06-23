@@ -355,13 +355,19 @@ def _record_throughline(record: logging.LogRecord) -> tuple[str, ...]:
     A record logging an exception (``exc_info`` set) prefers the chain captured
     where that exception was raised — otherwise an error logged above the
     failure would report only the unrelated chain active at the logging call.
+    The search walks the exception's cause chain (``__cause__`` then
+    ``__context__``) so a wrapper exception re-raised with ``raise W from
+    original`` still surfaces the original's raise-site throughline.
     Records with no such exception fall back to the currently active chain.
     """
     exc_info = record.exc_info
     if isinstance(exc_info, tuple) and exc_info[1] is not None:
-        captured = getattr(exc_info[1], _THROUGHLINE_EXC_ATTR, None)
-        if captured is not None:
-            return captured
+        exc: BaseException | None = exc_info[1]
+        while exc is not None:
+            captured = getattr(exc, _THROUGHLINE_EXC_ATTR, None)
+            if captured is not None:
+                return captured
+            exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
     return task_chain()
 
 

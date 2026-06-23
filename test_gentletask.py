@@ -1295,6 +1295,29 @@ class TestThroughlineNameFilter:
         assert "pipette into site" in record.throughline
         assert record.throughline[-1] == "pipette into site"
 
+    def test_wrapped_exception_carries_cause_throughline(self):
+        # raise_errors in acq4 wraps a task's failure in a new RuntimeError
+        # before surfacing it. The wrapper has no throughline tag of its own;
+        # _record_throughline must walk __cause__ to find the original's tag.
+        f = ThroughlineNameFilter()
+        try:
+            with throughline(name="task-body"):
+                raise ValueError("original")
+        except ValueError as original:
+            original_exc = original
+        wrapper = RuntimeError("wrapped")
+        try:
+            raise wrapper from original_exc
+        except RuntimeError as e:
+            exc = e
+        assert not hasattr(exc, "_gentletask_throughline")
+        record = logging.LogRecord(
+            "test", logging.ERROR, "", 0, "msg", (),
+            (type(exc), exc, exc.__traceback__),
+        )
+        f.filter(record)
+        assert record.throughline == ("task-body",)
+
     def test_untagged_exception_falls_back_to_live_chain(self):
         # An exception raised with no throughline active carries no tag, so a
         # record logged later under a live chain still reports that live chain.
