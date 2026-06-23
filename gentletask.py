@@ -869,9 +869,9 @@ class _TaskCore:
         narrative ancestry, so logs can still say its work was started in
         service of the operation that spawned it.
 
-        With ``raise_errors=True`` any exception from this task (other than
-        ``Stopped``) is re-raised loudly on a background daemon thread so it
-        surfaces through the process's unhandled-exception hook rather than
+        With non-false ``raise_errors``, any exception from this task (other
+        than ``Stopped``) is re-raised loudly on a background daemon thread so
+        it surfaces through the process's unhandled-exception hook rather than
         being silently discarded.
         """
         parent = current_task()
