@@ -361,8 +361,8 @@ def parent_detaching():
     sleep(10)
 ```
 
-`detach()` accepts a `raise_errors` message string to register an error surface
-at the same time:
+`detach()` accepts a `raise_errors` message string (or `False` to skip) to
+register an error surface at the same time:
 
 ```python
 def parent_fn():
@@ -394,8 +394,18 @@ fire_and_forget = asynch(some_work, detach=True, raise_errors="{name!r}: {error}
 fire_and_forget()   # errors surface even though we never call .wait()
 ```
 
-`raise_errors(task, message=...)` accepts an optional format string with three
-placeholders:
+The `raise_errors=` keyword on `ThreadTask`, `asynch`, and `detach` accepts
+`False` (off, the default) or a **format string** that becomes the error
+message. The value itself is the message — there is no separate `message=`
+argument at these call sites. `True` is also accepted and uses the default
+message, but the string form is preferred because the message travels with
+the call site.
+
+The standalone `raise_errors(task, message=...)` function works the same way
+but takes the message as a separate positional-or-keyword argument with a
+built-in default, so `raise_errors(task)` is valid.
+
+The format string supports three placeholders:
 
 | Placeholder | Meaning |
 |---|---|
