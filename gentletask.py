@@ -16,7 +16,7 @@ import traceback
 import weakref
 from typing import Any, Callable, Iterable, Iterator, Protocol, runtime_checkable
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 _logger = logging.getLogger(__name__)
 
@@ -499,6 +499,10 @@ def poll(
                 check_stop()  # stop arrived during the wait — raises Stopped
 
 
+Empty = _queue.Empty
+Full = _queue.Full
+
+
 class Queue:
     """Drop-in for queue.Queue. get() raises Stopped if the current task is stopped.
 
@@ -521,10 +525,10 @@ class Queue:
                 deadline = None if timeout is None else time.monotonic() + timeout
                 while not self._items:
                     if not block:
-                        raise _queue.Empty()
+                        raise Empty()
                     remaining = _remaining(deadline)
                     if remaining is not None and remaining <= 0:
-                        raise _queue.Empty()
+                        raise Empty()
                     self._cond.wait(remaining)
                 item = self._items.popleft()
                 self._cond.notify_all()  # wake a putter blocked on a full queue
@@ -544,7 +548,7 @@ class Queue:
                         return item
                     remaining = _remaining(deadline)
                     if remaining is not None and remaining <= 0:
-                        raise _queue.Empty()
+                        raise Empty()
                     self._cond.wait(remaining)
 
     def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
@@ -553,10 +557,10 @@ class Queue:
                 deadline = None if timeout is None else time.monotonic() + timeout
                 while len(self._items) >= self._maxsize:
                     if not block:
-                        raise _queue.Full()
+                        raise Full()
                     remaining = _remaining(deadline)
                     if remaining is not None and remaining <= 0:
-                        raise _queue.Full()
+                        raise Full()
                     self._cond.wait(remaining)
             self._items.append(item)
             self._unfinished += 1
@@ -1539,5 +1543,7 @@ __all__ = [
     "check_stop",
     "poll",
     "Queue",
+    "Empty",
+    "Full",
     "Event",
 ]

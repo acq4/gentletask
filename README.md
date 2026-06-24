@@ -741,6 +741,8 @@ free to use the stop-aware primitives.
 | `check_stop()` | Raise `Stopped` if the current task is stopped; like `sleep(0)`. |
 | `poll(fn, *, interval=0.05, timeout=None)` | Sample `fn` until truthy; stop-aware inter-sample wait. Returns `fn`'s truthy value, or the last falsy value on timeout. |
 | `Queue(maxsize=0)` | Drop-in for `queue.Queue`; `get()` raises `Stopped` if the current task is stopped. |
+| `Empty` | Re-export of `queue.Empty`; raised by `Queue.get()` on timeout or when the queue is empty and `block=False`. |
+| `Full` | Re-export of `queue.Full`; raised by `Queue.put()` on timeout or when the queue is full and `block=False`. |
 | `Event()` | Drop-in for `threading.Event`; `wait()` raises `Stopped` if the current task is stopped. |
 
 Every `Stopped` these raise carries the stopped task's `stop_reason` as its

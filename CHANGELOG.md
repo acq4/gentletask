@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is in `0.x`, the public API is not yet frozen: breaking
 changes bump the minor version and are called out under **Migration** below.
 
+## [0.6.1] - 2026-06-24
+
+### Added
+
+- **`Empty`** and **`Full`** — re-exports of `queue.Empty` and `queue.Full` so
+  callers can catch the exceptions `Queue.get()` and `Queue.put()` raise without
+  importing from `queue` directly.
+
 ## [0.6.0] - 2026-06-23
 
 ### Added
