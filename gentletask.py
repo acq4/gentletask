@@ -826,6 +826,24 @@ class _TaskCore:
                 self._stop_requested.set()
                 children = list(self._children)
                 callbacks, self._stop_callbacks = list(self._stop_callbacks), []
+                # Every cooperative stop passes through here exactly once, so this is the
+                # single place a task can record WHY it was stopped and WHO requested it.
+                # current_task() is the task (if any) running the stop() call; the stack
+                # pinpoints the exact call site. Guarded on DEBUG so normal runs pay
+                # nothing, but the answer is always available when debug logging is on.
+                if _logger.isEnabledFor(logging.DEBUG):
+                    requester = current_task()
+                    requester_desc = (
+                        f"task {requester._name!r}" if requester is not None else "non-task caller"
+                    )
+                    _logger.debug(
+                        "Task %r stop requested (reason: %r) by %s; call site:\n%s",
+                        self._name,
+                        reason,
+                        requester_desc,
+                        "".join(traceback.format_stack()[:-1]),
+                    )
+
         # Fire callbacks and cascade outside the lock: a stop callback typically
         # acquires another object's lock to wake a waiter, and a child's stop()
         # takes the child's lock — holding ours here would invite deadlock.
@@ -836,6 +854,13 @@ class _TaskCore:
                 except Exception:
                     _logger.exception("stop callback raised")
             for child in children:
+                if _logger.isEnabledFor(logging.DEBUG):
+                    _logger.debug(
+                        "Task %r cascading stop (reason: %r) to child task %r",
+                        self._name,
+                        reason,
+                        getattr(child, "_name", child),
+                    )
                 _stop_child(child, reason)
         if wait:
             self._wait_for_stop_exit()
@@ -929,6 +954,16 @@ class _TaskCore:
         parent = current_task()
         if parent is not None and not self._detach and hasattr(parent, "_children"):
             parent._children.add(self)
+            # This link is why a task can be stopped without anyone stopping it
+            # directly: the parent's stop (or completion) cascades here. Log it so
+            # an unexpected parent-child relationship (e.g. a task created inside
+            # another task's callback) is visible before any cascade happens.
+            if _logger.isEnabledFor(logging.DEBUG):
+                _logger.debug(
+                    "Task %r registered as child of task %r; a stop of that parent will cascade here",
+                    self._name,
+                    getattr(parent, "_name", parent),
+                )
 
     def _finish(self, result: Any = None, exc: BaseException | None = None) -> None:
         """Complete the task; the first completion wins, later calls are no-ops.
@@ -964,6 +999,17 @@ class _TaskCore:
             reason = self._stop_reason
         for child in children:
             if not child.is_done:
+                # A finishing parent stops its still-running children. This is a
+                # common source of surprising "stopped for no reason" cascades
+                # (e.g. a child task constructed inside the parent's finish
+                # callback), so name both tasks and the reason.
+                if _logger.isEnabledFor(logging.DEBUG):
+                    _logger.debug(
+                        "Task %r finished; stopping still-running child task %r (reason: %r)",
+                        self._name,
+                        getattr(child, "_name", child),
+                        reason,
+                    )
                 _stop_child(child, reason)
 
 

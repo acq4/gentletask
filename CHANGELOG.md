@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is in `0.x`, the public API is not yet frozen: breaking
 changes bump the minor version and are called out under **Migration** below.
 
+## Unreleased
+
+### Added
+
+- If the gentletask logger is set to DEBUG or lower, add a bunch of extra logging
+  to help trace task relationships.
+
 ## [0.7.0] - 2026-07-03
 
 ### Added
