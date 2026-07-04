@@ -733,6 +733,88 @@ class TestThreadTaskStop:
         assert exc_ref[0] is None  # finished normally; __del__ stop() was a no-op
 
 
+class TestStopWait:
+    def test_stop_without_wait_returns_before_task_exits(self):
+        # The default stop() is fire-and-forget: it returns promptly even
+        # though the task lingers in a slow finally before it actually exits.
+        def slow():
+            try:
+                sleep(10)
+            finally:
+                time.sleep(0.2)
+
+        t = ThreadTask(slow)
+        time.sleep(0.05)
+        start = time.monotonic()
+        t.stop()
+        assert time.monotonic() - start < 0.1
+        # The daemon thread finishes its slow finally on its own; nothing to wait on.
+
+    def test_stop_wait_blocks_until_task_exits(self):
+        # stop(wait=True) blocks until the body has fully unwound, including a
+        # slow finally, so the task is genuinely done when the call returns.
+        finished = []
+
+        def slow():
+            try:
+                sleep(10)
+            finally:
+                time.sleep(0.2)
+                finished.append(True)
+
+        t = ThreadTask(slow)
+        time.sleep(0.05)
+        t.stop(wait=True)
+        assert finished == [True]
+        assert t.is_done
+
+    def test_stop_wait_swallows_own_stopped(self):
+        # A task that cooperatively raises its own Stopped in response to the
+        # stop is the expected outcome, so stop(wait=True) does not re-raise it.
+        t = ThreadTask(lambda: sleep(10))
+        time.sleep(0.05)
+        t.stop(wait=True)  # must not raise
+        assert t.is_done
+
+    def test_stop_wait_reraises_other_exception(self):
+        # If the task exits badly (any exception other than its own Stopped),
+        # stop(wait=True) surfaces that failure to the caller who stopped it.
+        def bad():
+            try:
+                sleep(10)
+            except Stopped:
+                raise ValueError("cleanup blew up")
+
+        t = ThreadTask(bad)
+        time.sleep(0.05)
+        with pytest.raises(ValueError, match="cleanup blew up"):
+            t.stop(wait=True)
+
+    def test_stop_wait_on_manual_task_swallows_stopped(self):
+        # A stopped ManualTask self-completes with Stopped; stop(wait=True)
+        # returns once it is done and does not re-raise that Stopped.
+        mt = ManualTask()
+        mt.stop(wait=True)  # must not raise
+        assert mt.is_done
+
+    def test_stop_wait_reraises_manual_task_failure(self):
+        # A stop callback that fails the task with a real error means the task
+        # had a bad time; stop(wait=True) surfaces it.
+        mt = ManualTask()
+        mt.add_stop_callback(lambda: mt.fail(ValueError("producer blew up")))
+        with pytest.raises(ValueError, match="producer blew up"):
+            mt.stop(wait=True)
+
+    def test_stop_wait_on_multi_task(self):
+        # A MultiTask stopped with wait=True is done when the call returns and
+        # swallows the aggregated Stopped from its stopped children.
+        children = [ThreadTask(lambda: sleep(10)) for _ in range(2)]
+        mt = MultiTask(children)
+        time.sleep(0.05)
+        mt.stop(wait=True)  # must not raise
+        assert mt.is_done
+
+
 # ---------------------------------------------------------------------------
 # asynch factory
 # ---------------------------------------------------------------------------

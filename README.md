@@ -69,6 +69,18 @@ which then travels into the `Stopped` exception raised at the wait site — so
 plain `stop()` with no reason behaves exactly as before, yielding a reason-less
 `Stopped()`. Read the recorded reason back via the `stop_reason` property.
 
+By default `stop()` is fire-and-forget: it requests the stop and returns without
+waiting for the task to unwind. Pass `wait=True` to block until the task has
+actually exited. A task that exits badly — with any exception other than the
+`Stopped` it raises in response to this stop — re-raises that failure from
+`stop()`, so the caller who stopped it learns something went wrong; the `Stopped`
+you asked for is swallowed, since it is the expected outcome.
+
+```python
+task.stop(wait=True)                     # block until the task has fully exited
+task.stop("shutting down", wait=True)    # with a reason, too
+```
+
 Stop propagation is **poll-free**: `stop()` *pushes* a notification rather than
 relying on a polling loop. Before a primitive parks, it registers a zero-arg
 callback via `add_stop_callback`; `stop()` fires those callbacks (exactly once,

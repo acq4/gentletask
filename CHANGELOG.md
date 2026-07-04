@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is in `0.x`, the public API is not yet frozen: breaking
 changes bump the minor version and are called out under **Migration** below.
 
+## [Unreleased]
+
+### Added
+
+- **`wait=False` parameter on `Task.stop()`** — with `wait=True`, `stop()` blocks
+  until the task has actually exited. A task that exits badly (any exception
+  other than the `Stopped` it raises in response to this stop) re-raises that
+  failure from `stop()`; the `Stopped` we asked for is swallowed. Honored on a
+  redundant stop too, so a second `stop(wait=True)` still blocks until done.
+
 ## [0.6.1] - 2026-06-24
 
 ### Added

@@ -317,7 +317,7 @@ class Task(Protocol):
     def result(self) -> Any: ...
 
     def wait(self, timeout: float | None = None) -> Any: ...
-    def stop(self, reason: str | None = None) -> None: ...
+    def stop(self, reason: str | None = None, wait: bool = False) -> None: ...
     def add_finish_callback(
         self, fn: Callable[[Any, BaseException | None], Any]
     ) -> None: ...
@@ -804,31 +804,55 @@ class _TaskCore:
             raise self._exception
         return self._result
 
-    def stop(self, reason: str | None = None) -> None:
+    def stop(self, reason: str | None = None, wait: bool = False) -> None:
         """Request cooperative stop; fire stop callbacks; cascade to children.
 
         Idempotent: the stop callbacks fire exactly once, on the first stop, and
         only that first stop records *reason*. A later stop() is a no-op and does
         not overwrite the reason. The reason cascades to children so a parent
         stop explains itself all the way down.
+
+        With ``wait=True`` the call blocks until the task has actually exited
+        (see ``_wait_for_stop_exit``): a task that exits badly re-raises its
+        failure here, while the ``Stopped`` a task raises in response to this
+        very stop is swallowed, since we asked for it. ``wait`` is honored even
+        when this is a redundant stop, so a second ``stop(wait=True)`` still
+        blocks until the task is done.
         """
         with self._lock:
-            if self._stop_requested.is_set():
-                return  # already stopped; callbacks fired on the first stop
-            self._stop_reason = reason
-            self._stop_requested.set()
-            children = list(self._children)
-            callbacks, self._stop_callbacks = list(self._stop_callbacks), []
+            first = not self._stop_requested.is_set()
+            if first:
+                self._stop_reason = reason
+                self._stop_requested.set()
+                children = list(self._children)
+                callbacks, self._stop_callbacks = list(self._stop_callbacks), []
         # Fire callbacks and cascade outside the lock: a stop callback typically
         # acquires another object's lock to wake a waiter, and a child's stop()
         # takes the child's lock — holding ours here would invite deadlock.
-        for cb in callbacks:
-            try:
-                cb()
-            except Exception:
-                _logger.exception("stop callback raised")
-        for child in children:
-            _stop_child(child, reason)
+        if first:
+            for cb in callbacks:
+                try:
+                    cb()
+                except Exception:
+                    _logger.exception("stop callback raised")
+            for child in children:
+                _stop_child(child, reason)
+        if wait:
+            self._wait_for_stop_exit()
+
+    def _wait_for_stop_exit(self) -> None:
+        """Block until this task has exited, re-raising a non-``Stopped`` failure.
+
+        Used by ``stop(wait=True)``. The ``Stopped`` a task raises in response to
+        the stop we just requested is the expected outcome, so it is swallowed;
+        any other exception means the task exited badly and is re-raised so the
+        caller who stopped it learns of the failure. A task that finished with a
+        result (it completed before the stop landed) simply returns.
+        """
+        self._done.wait()
+        exc = self._exception
+        if exc is not None and not isinstance(exc, Stopped):
+            raise exc
 
     def add_finish_callback(
         self, fn: Callable[[Any, BaseException | None], Any]
@@ -1220,7 +1244,7 @@ class ManualTask(_TaskCore):
         """
         self._finish(exc=exc)
 
-    def stop(self, reason: str | None = None) -> None:
+    def stop(self, reason: str | None = None, wait: bool = False) -> None:
         """Request stop, then complete the task with ``Stopped``.
 
         A stopped ManualTask has no body to raise ``Stopped``, so it must
@@ -1232,9 +1256,17 @@ class ManualTask(_TaskCore):
         the task is already complete and otherwise wins. The injected
         ``Stopped`` carries the recorded reason so a stopped task's waiters learn
         WHY. Idempotent via ``super().stop()``'s own guard.
+
+        ``wait`` is applied AFTER self-completion, never passed to
+        ``super().stop()`` — the base would block on a task this method has not
+        yet completed, deadlocking. Since a ManualTask self-completes here,
+        ``wait=True`` just re-raises a non-``Stopped`` failure (e.g. a stop
+        callback that failed the task) once it is done.
         """
         super().stop(reason)
         self._finish(exc=_stopped(self._stop_reason))
+        if wait:
+            self._wait_for_stop_exit()
 
     def __repr__(self) -> str:
         status = (
@@ -1349,7 +1381,7 @@ class MultiTask(_TaskCore):
         else:
             self._finish(exc=MultiException("Multiple tasks failed", excs))
 
-    def stop(self, reason: str | None = None) -> None:
+    def stop(self, reason: str | None = None, wait: bool = False) -> None:
         """Stop every child, then this task; complete with Stopped if still open.
 
         Each child's own stop drives ``_child_finished``, which would normally
@@ -1358,6 +1390,11 @@ class MultiTask(_TaskCore):
         we self-complete with ``Stopped`` if still incomplete afterwards. The
         injected ``Stopped`` carries the recorded reason. Idempotent via
         ``super().stop()``'s own guard.
+
+        ``wait`` is applied after self-completion (as in ``ManualTask.stop``):
+        since a MultiTask self-completes here, ``wait=True`` blocks only until
+        this task is done and re-raises a non-``Stopped`` failure. It does not
+        wait for each stopped child's own body to unwind.
         """
         # Set our own stop flag BEFORE cascading to the children: each child's
         # stop() drives _child_finished synchronously, and that handler checks
@@ -1368,6 +1405,8 @@ class MultiTask(_TaskCore):
         for t in self._tasks:
             _stop_child(t, reason)
         self._finish(exc=_stopped(self._stop_reason))
+        if wait:
+            self._wait_for_stop_exit()
 
     def __repr__(self) -> str:
         status = (
