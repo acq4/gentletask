@@ -16,7 +16,7 @@ import traceback
 import weakref
 from typing import Any, Callable, Iterable, Iterator, Protocol, runtime_checkable
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 _logger = logging.getLogger(__name__)
 
