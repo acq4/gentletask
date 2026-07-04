@@ -666,6 +666,31 @@ class TestThreadTaskStop:
             t.wait(timeout=1.0)
         assert t.is_stopped
 
+    def test_stopping_a_child_surfaces_through_parent_wait(self):
+        # Stopping a child while the parent is blocked in child.wait() re-raises
+        # the child's Stopped in the parent: stop travels UP through wait() as
+        # the child's outcome, carrying the reason. It is NOT a stop of the
+        # parent itself — the parent's own stop flag stays clear.
+        holder = {}
+        ready = threading.Event()
+
+        def child_fn():
+            sleep(10)
+
+        def parent_fn():
+            child = ThreadTask(child_fn, name="child")
+            holder["child"] = child
+            ready.set()
+            child.wait()  # parent parks here
+
+        p = ThreadTask(parent_fn, name="parent")
+        assert ready.wait(timeout=1.0)
+        holder["child"].stop("child stopped directly")
+
+        with pytest.raises(Stopped, match="child stopped directly"):
+            p.wait(timeout=1.0)
+        assert not p.is_stopped  # the parent was never stopped, only its child
+
     def test_detach_prevents_stop_cascade(self):
         child_ran = []
 
@@ -804,6 +829,29 @@ class TestStopWait:
         mt.add_stop_callback(lambda: mt.fail(ValueError("producer blew up")))
         with pytest.raises(ValueError, match="producer blew up"):
             mt.stop(wait=True)
+
+    def test_stop_wait_on_child_does_not_raise_in_stopper(self):
+        # A parent that STOPS its child with wait=True does not receive the
+        # child's own Stopped: it asked for the stop, so the expected Stopped is
+        # swallowed even though the call blocks until the child has exited. This
+        # is the counterpart to a plain child.wait(), which DOES re-raise it.
+        holder = {}
+        ready = threading.Event()
+
+        def child_fn():
+            sleep(10)
+
+        def parent_fn():
+            child = ThreadTask(child_fn, name="child")
+            holder["child"] = child
+            ready.set()
+            child.stop("done with child", wait=True)  # must NOT raise
+            return "parent finished cleanly"
+
+        p = ThreadTask(parent_fn, name="parent")
+        assert ready.wait(timeout=1.0)
+        assert p.wait(timeout=1.0) == "parent finished cleanly"
+        assert holder["child"].is_done
 
     def test_stop_wait_on_multi_task(self):
         # A MultiTask stopped with wait=True is done when the call returns and
