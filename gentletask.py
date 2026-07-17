@@ -1303,6 +1303,16 @@ class ManualTask(_TaskCore):
         ``Stopped`` carries the recorded reason so a stopped task's waiters learn
         WHY. Idempotent via ``super().stop()``'s own guard.
 
+        Ordering hazard for *polling* producers: a producer thread that observes
+        ``is_stopped`` on its own cadence (rather than via a stop callback) can
+        wake in the window between ``super().stop()`` setting the stop flag and
+        the ``_finish`` below injecting ``Stopped``. If it completes the task
+        there with its own exception, that wins the idempotent-``_finish`` race
+        and the cooperative ``Stopped`` is lost. A producer must therefore treat
+        a task it observes as stopped as owned by ``stop()``: abort its
+        side-effects and return without completing the task, leaving the
+        ``Stopped`` injection here to be the outcome.
+
         ``wait`` is applied AFTER self-completion, never passed to
         ``super().stop()`` — the base would block on a task this method has not
         yet completed, deadlocking. Since a ManualTask self-completes here,
