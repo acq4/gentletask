@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import pickle
 import threading
 import time
+import weakref
 
 import queue as _queue
 import pytest
@@ -756,6 +758,72 @@ class TestThreadTaskStop:
         del t
         time.sleep(0.05)
         assert exc_ref[0] is None  # finished normally; __del__ stop() was a no-op
+
+
+class TestGarbageCollection:
+    """__del__ stops an unwaited task, so what keeps a *running* task alive matters.
+
+    Fire-and-forget callers (a best-effort abort fan-out, say) start a detached
+    task and keep no reference to it. That is only safe because a started task
+    cannot be collected while its thread runs; if it could, __del__ would stop
+    the work mid-flight. The guarantee is real but incidental — it comes from
+    the threading machinery, not from anything this module does on purpose —
+    so it is pinned here rather than left to be rediscovered.
+    """
+
+    def test_running_task_is_not_collected_when_all_references_are_dropped(self):
+        outcome = []
+
+        def body():
+            sleep(0.3)  # stop-aware: raises Stopped if the task is stopped
+            outcome.append("completed")
+
+        def spawn():
+            # Build and drop the task inside a frame that goes away, so no
+            # local in the test function keeps it alive. The body deliberately
+            # does not call current_task(), which would itself hold a
+            # reference and mask the property under test.
+            t = ThreadTask(
+                body,
+                name="gc-victim",
+                detach=True,
+                on_finish=lambda r, e: outcome.append("ok" if e is None else type(e).__name__),
+            )
+            return weakref.ref(t)
+
+        ref = spawn()
+        for _ in range(3):
+            gc.collect()
+        alive = ref() is not None
+        assert alive, "running ThreadTask was collected; __del__ would stop it mid-flight"
+
+        time.sleep(0.6)
+        assert outcome == ["completed", "ok"]
+
+    def test_running_thread_holds_the_reference_that_prevents_collection(self):
+        # Documents WHY the task above survives: the interpreter keeps the
+        # Thread in threading._active for the whole run, and Thread._args holds
+        # the bound self._run (CPython only clears _target/_args/_kwargs after
+        # the body returns). If either link ever breaks, this test names the
+        # cause instead of leaving the collection test above to fail obscurely.
+        t = ThreadTask(lambda: sleep(5), name="gc-mechanism", detach=True)
+        try:
+            assert threading._active.get(t._thread.ident) is t._thread
+            assert t._run in getattr(t._thread, "_args", ())
+            assert t._run.__self__ is t
+        finally:
+            t.stop()
+
+    def test_del_stops_a_task_that_was_never_started(self):
+        # The complementary case: with start=False nothing external holds the
+        # task, so dropping it does reach __del__ and does stop the task. This
+        # is the situation __del__ exists for.
+        stopped = []
+        t = ThreadTask(lambda: sleep(5), name="never-started", start=False)
+        t.add_stop_callback(lambda: stopped.append(True))
+        del t
+        gc.collect()
+        assert stopped == [True]
 
 
 class TestStopWait:
