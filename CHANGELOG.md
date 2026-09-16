@@ -14,6 +14,24 @@ changes bump the minor version and are called out under **Migration** below.
 - If the gentletask logger is set to DEBUG or lower, add a bunch of extra logging
   to help trace task relationships.
 
+### Fixed
+
+- **A child whose `stop()` fails no longer derails the cascade or its parent.**
+  Stopping a child is a request made of that child, not part of the requester's
+  own work, so a failure there is now logged at ERROR (with traceback, naming
+  the child) and the cascade continues. Previously the exception propagated: the
+  siblings after the failing child went un-stopped, and where the cascade runs
+  from a parent's `finally` block — `ThreadTask._run`, `MultiTask.stop`, the
+  `WorkerThread` runner — it also skipped the parent's own completion, so the
+  parent never finished and every waiter on it blocked forever. A device proxy
+  whose `stop()` raised on an unreachable device was enough to strand a whole
+  task tree.
+- Those three completion sites now complete their task from a `finally`, so
+  "a started task always completes" no longer depends on the stop cascade being
+  exception-free. The cascade also reads `child.is_done` and formats a log line,
+  either of which a hand-rolled `Task` can make raise; such a failure still
+  surfaces, but only after the task has completed.
+
 ## [0.7.0] - 2026-07-03
 
 ### Added

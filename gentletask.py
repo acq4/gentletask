@@ -80,11 +80,29 @@ def _stop_child(task: "Task", reason: str | None) -> None:
     task still satisfies the protocol structurally, so a cascade must not break
     on it: a binding ``TypeError`` (raised before the body runs, so there is no
     double-stop) falls back to a reason-less stop.
+
+    A child's stop() that *fails* must not break the cascade either. Stopping a
+    child is a request made of that child, not part of the requester's own work:
+    the siblings after it still need stopping, and where a cascade runs from a
+    parent's finally block (``ThreadTask._run``, ``MultiTask.stop``, the worker
+    runner) letting the failure out would skip the parent's own completion and
+    leave every waiter on it blocked forever. So the failure is logged and the
+    cascade continues -- the same footing stop and finish callbacks already
+    stand on. The child keeps its own state: it stays un-stopped, and says so in
+    its own repr.
     """
     try:
-        task.stop(reason)
-    except TypeError:
-        task.stop()
+        try:
+            task.stop(reason)
+        except TypeError:
+            task.stop()
+    except Exception:
+        # Exception, not BaseException: a KeyboardInterrupt or SystemExit
+        # arriving here is not this child's failure and still propagates.
+        _logger.exception(
+            "Task %r stop raised; continuing the cascade without it",
+            getattr(task, "_name", task),
+        )
 
 
 class MultiException(Exception):
@@ -1100,8 +1118,14 @@ class ThreadTask(_TaskCore):
             except BaseException as e:
                 exc = e
             finally:
-                self._stop_running_children()
-                self._finish(result=result, exc=exc)
+                # try/finally, even though _stop_child swallows a child's own
+                # failure: the cascade also reads child.is_done and formats a
+                # log line, so a hostile Task implementation can still raise
+                # here. Completing this task is not allowed to depend on that.
+                try:
+                    self._stop_running_children()
+                finally:
+                    self._finish(result=result, exc=exc)
 
     def __del__(self) -> None:
         if not self._waited and not self.is_done:
@@ -1458,9 +1482,13 @@ class MultiTask(_TaskCore):
         # children's Stoppeds into a MultiException. super().stop() also records
         # the reason and fires our stop callbacks.
         super().stop(reason)
-        for t in self._tasks:
-            _stop_child(t, reason)
-        self._finish(exc=_stopped(self._stop_reason))
+        try:
+            for t in self._tasks:
+                _stop_child(t, reason)
+        finally:
+            # Self-completion is what keeps this task's waiters from hanging, so
+            # it must happen even if the cascade above raised.
+            self._finish(exc=_stopped(self._stop_reason))
         if wait:
             self._wait_for_stop_exit()
 
@@ -1605,11 +1633,15 @@ class WorkerThread:
                     except BaseException as e:
                         exc = e
                     finally:
-                        task._stop_running_children()
-                        if exc is not None:
-                            task.fail(exc)
-                        else:
-                            task.resolve(result)
+                        # As in ThreadTask._run: the submitted task completes
+                        # whether or not stopping its children went cleanly.
+                        try:
+                            task._stop_running_children()
+                        finally:
+                            if exc is not None:
+                                task.fail(exc)
+                            else:
+                                task.resolve(result)
 
 
 # ---------------------------------------------------------------------------
