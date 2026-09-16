@@ -2685,3 +2685,200 @@ class TestMultiTask:
         with pytest.raises(Stopped) as info:
             m.wait(timeout=1.0)
         assert str(info.value) == "because"
+
+
+class TestStopCascadeFailures:
+    """A child whose stop() fails must not derail the cascade or its parent.
+
+    Stopping a child is a request made of that child, not part of the
+    requester's own work. A failure there used to propagate: the remaining
+    siblings went un-stopped, and where the cascade runs from a parent's
+    finally block it also skipped the parent's own completion, leaving every
+    waiter on that parent blocked forever.
+    """
+
+    class RaisingStopTask:
+        """A structurally-valid Task whose stop() always fails."""
+
+        def __init__(self, name="raising-child", exc=None):
+            self._name = name
+            self._exc = exc or RuntimeError("device unreachable")
+            self.stop_calls = 0
+
+        @property
+        def is_done(self):
+            return False
+
+        @property
+        def is_stopped(self):
+            return False
+
+        def stop(self, reason=None):
+            self.stop_calls += 1
+            raise self._exc
+
+        def wait(self, timeout=None):
+            raise AssertionError("not used")
+
+    class RecordingTask:
+        """A structurally-valid Task that records whether it was stopped."""
+
+        def __init__(self, name="recording-child"):
+            self._name = name
+            self.stopped_with = []
+
+        @property
+        def is_done(self):
+            # A real task is done once stopped; mirroring that keeps a second
+            # cascade over the same child from counting as another stop.
+            return bool(self.stopped_with)
+
+        @property
+        def is_stopped(self):
+            return bool(self.stopped_with)
+
+        def stop(self, reason=None):
+            self.stopped_with.append(reason)
+
+        def wait(self, timeout=None):
+            raise AssertionError("not used")
+
+    def _adopt(self, parent, *children):
+        """Register *children* on *parent* the way _register_with_parent would."""
+        for child in children:
+            parent._children.add(child)
+
+    # -- a finishing parent -------------------------------------------------
+
+    def test_parent_completes_with_its_own_result(self):
+        """A failing child stop must not become the parent's outcome."""
+        bad = self.RaisingStopTask()
+        task = ThreadTask(lambda: (self._adopt(current_task(), bad), "my result")[1])
+
+        assert task.wait(timeout=5) == "my result"
+        assert bad.stop_calls == 1
+
+    def test_parent_completes_with_its_own_exception(self):
+        """A failing child stop must not mask why the parent failed."""
+        bad = self.RaisingStopTask()
+
+        def body():
+            self._adopt(current_task(), bad)
+            raise ValueError("my failure")
+
+        task = ThreadTask(body)
+        with pytest.raises(ValueError, match="my failure"):
+            task.wait(timeout=5)
+
+    def test_parent_does_not_hang_when_child_stop_fails(self):
+        """The regression: skipping _finish left waiters blocked forever."""
+        bad = self.RaisingStopTask()
+        task = ThreadTask(lambda: self._adopt(current_task(), bad))
+
+        task.wait(timeout=5)
+        assert task.is_done
+
+    def test_remaining_children_are_still_stopped(self):
+        """A raising child must not strand the siblings after it."""
+        before = self.RecordingTask("before")
+        bad = self.RaisingStopTask()
+        after = self.RecordingTask("after")
+        task = ThreadTask(lambda: self._adopt(current_task(), before, bad, after))
+
+        task.wait(timeout=5)
+        assert before.stopped_with == [None]
+        assert after.stopped_with == [None], "sibling after the raising child was stranded"
+
+    def test_child_stop_failure_is_logged(self, caplog):
+        """Swallowing must not mean hiding: the failure still reaches the log."""
+        bad = self.RaisingStopTask(exc=RuntimeError("device unreachable"))
+        with caplog.at_level(logging.ERROR, logger="gentletask"):
+            ThreadTask(lambda: self._adopt(current_task(), bad)).wait(timeout=5)
+
+        assert any(
+            "raising-child" in r.getMessage() and r.exc_info for r in caplog.records
+        ), "expected an exc_info log record naming the failing child"
+
+    @pytest.mark.filterwarnings(
+        "ignore::pytest.PytestUnhandledThreadExceptionWarning"
+    )
+    def test_a_child_that_raises_from_is_done_still_lets_the_parent_finish(self):
+        """The cascade touches more than stop(); completion must not depend on it.
+
+        Only the parent's completion is guaranteed here. A Task whose is_done
+        explodes is broken, and that exception still escapes the thread after
+        the parent completes -- deliberately, so the broken implementation is
+        not hidden. Hence the expected unhandled-thread-exception warning.
+        """
+
+        class HostileTask(TestStopCascadeFailures.RecordingTask):
+            @property
+            def is_done(self):
+                raise RuntimeError("is_done exploded")
+
+        # _children is a WeakSet, so the child must outlive the cascade.
+        hostile = HostileTask()
+        task = ThreadTask(lambda: self._adopt(current_task(), hostile))
+
+        task.wait(timeout=5)
+        assert task.is_done
+        # wait() returns the moment _finish sets done, while the thread is still
+        # unwinding the is_done failure. Join so that escape is reported against
+        # this test -- where it is expected -- rather than whichever test runs next.
+        task._thread.join(timeout=5)
+        assert not task._thread.is_alive()
+
+    # -- an explicitly stopped parent ---------------------------------------
+
+    def test_explicit_stop_cascade_continues_past_a_failure(self):
+        """stop() already guards its callbacks; children get the same footing."""
+        started = threading.Event()
+        before = self.RecordingTask("before")
+        bad = self.RaisingStopTask()
+        after = self.RecordingTask("after")
+
+        def body():
+            self._adopt(current_task(), before, bad, after)
+            started.set()
+            Event().wait()  # stop-aware; raises Stopped when we stop the task
+
+        task = ThreadTask(body)
+        assert started.wait(timeout=5)
+        task.stop()
+
+        with pytest.raises(Stopped):
+            task.wait(timeout=5)
+        assert before.stopped_with == [None]
+        assert after.stopped_with == [None], "sibling after the raising child was stranded"
+
+    # -- MultiTask ----------------------------------------------------------
+
+    def test_multitask_stop_completes_when_a_member_stop_fails(self):
+        """MultiTask.stop self-completes; a failing member must not prevent it."""
+
+        class RaisingStopManualTask(ManualTask):
+            def stop(self, reason=None, wait=False):
+                raise RuntimeError("device unreachable")
+
+        bad = RaisingStopManualTask(name="bad-member")
+        after = ManualTask(name="after-member")
+        multi = MultiTask([bad, after], name="multi")
+
+        multi.stop("because")
+
+        assert multi.is_done, "a failing member stop left MultiTask's waiters hanging"
+        with pytest.raises(Stopped):
+            multi.wait(timeout=5)
+        assert after.is_stopped, "member after the raising one was stranded"
+
+    # -- WorkerThread -------------------------------------------------------
+
+    def test_pool_task_completes_when_a_child_stop_fails(self):
+        """The worker runner completes its task in a finally, like ThreadTask."""
+        bad = self.RaisingStopTask()
+        worker = WorkerThread(name="cascade-pool")
+        try:
+            task = worker.submit(lambda: (self._adopt(current_task(), bad), "done")[1])
+            assert task.wait(timeout=5) == "done"
+        finally:
+            worker.stop()
