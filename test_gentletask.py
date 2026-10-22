@@ -2788,3 +2788,313 @@ class TestMultiTask:
         with pytest.raises(Stopped) as info:
             m.wait(timeout=1.0)
         assert str(info.value) == "because"
+
+
+class TestStopCascadeFailures:
+    """A child whose stop() fails must not derail the cascade or its parent.
+
+    Stopping a child is a request made of that child, not part of the
+    requester's own work. A failure there used to propagate: the remaining
+    siblings went un-stopped, and where the cascade runs from a parent's
+    finally block it also skipped the parent's own completion, leaving every
+    waiter on that parent blocked forever.
+    """
+
+    class RaisingStopTask:
+        """A structurally-valid Task whose stop() always fails."""
+
+        def __init__(self, name="raising-child", exc=None):
+            self._name = name
+            self._exc = exc or RuntimeError("device unreachable")
+            self.stop_calls = 0
+
+        @property
+        def is_done(self):
+            return False
+
+        @property
+        def is_stopped(self):
+            return False
+
+        def stop(self, reason=None):
+            self.stop_calls += 1
+            raise self._exc
+
+        def wait(self, timeout=None):
+            raise AssertionError("not used")
+
+    class RecordingTask:
+        """A structurally-valid Task that records whether it was stopped."""
+
+        def __init__(self, name="recording-child"):
+            self._name = name
+            self.stopped_with = []
+
+        @property
+        def is_done(self):
+            # A real task is done once stopped; mirroring that keeps a second
+            # cascade over the same child from counting as another stop.
+            return bool(self.stopped_with)
+
+        @property
+        def is_stopped(self):
+            return bool(self.stopped_with)
+
+        def stop(self, reason=None):
+            self.stopped_with.append(reason)
+
+        def wait(self, timeout=None):
+            raise AssertionError("not used")
+
+    class HostileIsDoneTask(RecordingTask):
+        """A Task whose ``is_done`` explodes.
+
+        The cascade reads ``is_done`` to skip already-finished children, so this
+        raises *before* the guarded ``_stop_child`` call -- the surface that
+        ``_stop_child``'s own guard cannot cover.
+        """
+
+        @property
+        def is_done(self):
+            raise RuntimeError("is_done exploded")
+
+    class CallbackFailure(BaseException):
+        """Not an Exception: stop() already guards those, so only this escapes."""
+
+    @classmethod
+    def _raise_base_exception(cls):
+        raise cls.CallbackFailure("stop callback exploded")
+
+    def _adopt(self, parent, *children):
+        """Register *children* on *parent* the way _register_with_parent would."""
+        for child in children:
+            parent._children.add(child)
+
+    # -- a finishing parent -------------------------------------------------
+
+    def test_parent_completes_with_its_own_result(self):
+        """A failing child stop must not become the parent's outcome."""
+        bad = self.RaisingStopTask()
+        task = ThreadTask(lambda: (self._adopt(current_task(), bad), "my result")[1])
+
+        assert task.wait(timeout=5) == "my result"
+        assert bad.stop_calls == 1
+
+    def test_parent_completes_with_its_own_exception(self):
+        """A failing child stop must not mask why the parent failed."""
+        bad = self.RaisingStopTask()
+
+        def body():
+            self._adopt(current_task(), bad)
+            raise ValueError("my failure")
+
+        task = ThreadTask(body)
+        with pytest.raises(ValueError, match="my failure"):
+            task.wait(timeout=5)
+
+    def test_parent_does_not_hang_when_child_stop_fails(self):
+        """The regression: skipping _finish left waiters blocked forever."""
+        bad = self.RaisingStopTask()
+        task = ThreadTask(lambda: self._adopt(current_task(), bad))
+
+        task.wait(timeout=5)
+        assert task.is_done
+
+    def test_remaining_children_are_still_stopped(self):
+        """A raising child must not strand the siblings after it."""
+        before = self.RecordingTask("before")
+        bad = self.RaisingStopTask()
+        after = self.RecordingTask("after")
+        task = ThreadTask(lambda: self._adopt(current_task(), before, bad, after))
+
+        task.wait(timeout=5)
+        assert before.stopped_with == [None]
+        assert after.stopped_with == [None], "sibling after the raising child was stranded"
+
+    def test_child_stop_failure_is_logged(self, caplog):
+        """Swallowing must not mean hiding: the failure still reaches the log."""
+        bad = self.RaisingStopTask(exc=RuntimeError("device unreachable"))
+        with caplog.at_level(logging.ERROR, logger="gentletask"):
+            ThreadTask(lambda: self._adopt(current_task(), bad)).wait(timeout=5)
+
+        assert any(
+            "raising-child" in r.getMessage() and r.exc_info for r in caplog.records
+        ), "expected an exc_info log record naming the failing child"
+
+    def test_a_child_that_raises_from_is_done_still_lets_the_parent_finish(self):
+        """The cascade touches more than stop(); completion must not depend on it.
+
+        A Task whose is_done explodes is broken, but the cascade absorbs it the
+        same way it absorbs a failing stop(): the parent completes and the
+        thread unwinds cleanly, with the failure recorded in the log.
+        """
+        # _children is a WeakSet, so the child must outlive the cascade.
+        hostile = self.HostileIsDoneTask()
+        task = ThreadTask(lambda: self._adopt(current_task(), hostile))
+
+        task.wait(timeout=5)
+        assert task.is_done
+        task._thread.join(timeout=5)
+        assert not task._thread.is_alive()
+
+    def test_siblings_survive_a_child_that_raises_from_is_done(self):
+        """A hostile is_done must not strand the rest of the cascade.
+
+        _children is a WeakSet, so the iteration order is not ours to choose and
+        a single hostile child could happen to sort last, where an unguarded
+        loop looks healthy. Several of them interleaved with the recorders makes
+        that escape vanishingly unlikely: an unguarded loop survives only if
+        every recorder sorts ahead of every hostile child.
+        """
+        hostiles = [self.HostileIsDoneTask(f"hostile{i}") for i in range(8)]
+        siblings = [self.RecordingTask(f"sibling{i}") for i in range(8)]
+        task = ThreadTask(
+            lambda: self._adopt(current_task(), *hostiles, *siblings)
+        )
+
+        task.wait(timeout=5)
+        stranded = [s._name for s in siblings if not s.stopped_with]
+        assert not stranded, f"a hostile sibling stranded {stranded}"
+
+    def test_a_cascade_failure_before_stop_is_logged(self, caplog):
+        """Swallowing must not mean hiding, for this surface either."""
+        hostile = self.HostileIsDoneTask("exploding-child")
+        with caplog.at_level(logging.ERROR, logger="gentletask"):
+            ThreadTask(lambda: self._adopt(current_task(), hostile)).wait(timeout=5)
+
+        assert any(
+            "exploding-child" in r.getMessage() and r.exc_info for r in caplog.records
+        ), "expected an exc_info log record naming the child that raised"
+
+    # -- an explicitly stopped parent ---------------------------------------
+
+    def test_explicit_stop_cascade_continues_past_a_failure(self):
+        """stop() already guards its callbacks; children get the same footing."""
+        started = threading.Event()
+        before = self.RecordingTask("before")
+        bad = self.RaisingStopTask()
+        after = self.RecordingTask("after")
+
+        def body():
+            self._adopt(current_task(), before, bad, after)
+            started.set()
+            Event().wait()  # stop-aware; raises Stopped when we stop the task
+
+        task = ThreadTask(body)
+        assert started.wait(timeout=5)
+        task.stop()
+
+        with pytest.raises(Stopped):
+            task.wait(timeout=5)
+        assert before.stopped_with == [None]
+        assert after.stopped_with == [None], "sibling after the raising child was stranded"
+
+    # -- MultiTask ----------------------------------------------------------
+
+    def test_multitask_stop_completes_when_a_member_stop_fails(self):
+        """MultiTask.stop self-completes; a failing member must not prevent it."""
+
+        class RaisingStopManualTask(ManualTask):
+            def stop(self, reason=None, wait=False):
+                raise RuntimeError("device unreachable")
+
+        bad = RaisingStopManualTask(name="bad-member")
+        after = ManualTask(name="after-member")
+        multi = MultiTask([bad, after], name="multi")
+
+        multi.stop("because")
+
+        assert multi.is_done, "a failing member stop left MultiTask's waiters hanging"
+        with pytest.raises(Stopped):
+            multi.wait(timeout=5)
+        assert after.is_stopped, "member after the raising one was stranded"
+
+    def test_multitask_completes_when_the_superclass_stop_raises(self):
+        """Self-completion must not depend on super().stop() returning.
+
+        A stop callback raising BaseException is the reachable case: stop()
+        guards Exception, so only a BaseException escapes super().stop() -- and
+        it must still leave this task's waiters free.
+        """
+        multi = MultiTask([ManualTask(name="member")], name="multi")
+        multi.add_stop_callback(self._raise_base_exception)
+
+        with pytest.raises(self.CallbackFailure):
+            multi.stop("because")
+
+        assert multi.is_done, "a failing stop callback left MultiTask's waiters hanging"
+
+    def test_manualtask_completes_when_the_superclass_stop_raises(self):
+        """ManualTask self-completes on the same footing as MultiTask."""
+        task = ManualTask(name="manual")
+        task.add_stop_callback(self._raise_base_exception)
+
+        with pytest.raises(self.CallbackFailure):
+            task.stop("because")
+
+        assert task.is_done, "a failing stop callback left ManualTask's waiters hanging"
+
+    def test_stop_tolerates_a_requester_without_a_name(self, caplog):
+        """The DEBUG requester line must not break the stop it is describing.
+
+        current_task() is whatever is running the stop() call -- which may be a
+        hand-rolled Task that never grew a _name.
+        """
+
+        class NamelessTask:
+            """Satisfies the Task protocol structurally; has no _name."""
+
+            @property
+            def is_done(self):
+                return False
+
+            @property
+            def is_stopped(self):
+                return False
+
+            def stop(self, reason=None):
+                pass
+
+            def wait(self, timeout=None):
+                raise AssertionError("not used")
+
+        target = ManualTask(name="target")
+        with caplog.at_level(logging.DEBUG, logger="gentletask"):
+            with task_context(NamelessTask(), "nameless"):
+                target.stop("because")
+
+        assert target.is_done
+
+    # -- WorkerThread -------------------------------------------------------
+
+    def test_pool_task_completes_when_a_child_stop_fails(self):
+        """The worker runner completes its task in a finally, like ThreadTask."""
+        bad = self.RaisingStopTask()
+        worker = WorkerThread(name="cascade-pool")
+        try:
+            task = worker.submit(lambda: (self._adopt(current_task(), bad), "done")[1])
+            assert task.wait(timeout=5) == "done"
+        finally:
+            worker.stop()
+
+    def test_worker_survives_a_child_that_raises_from_is_done(self):
+        """The pump is long-lived: one hostile child must not take it down.
+
+        A task-level failure that kills the worker thread strands not just its
+        own waiters but every job submitted afterwards, since submit() goes on
+        accepting work the dead pump will never run.
+        """
+        hostile = self.HostileIsDoneTask("hostile")
+        worker = WorkerThread(name="cascade-pool-survival")
+        try:
+            first = worker.submit(
+                lambda: (self._adopt(current_task(), hostile), "first")[1]
+            )
+            assert first.wait(timeout=5) == "first"
+
+            second = worker.submit(lambda: "second")
+            assert (
+                second.wait(timeout=5) == "second"
+            ), "the hostile child killed the pump"
+        finally:
+            worker.stop()

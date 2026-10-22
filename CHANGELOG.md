@@ -14,6 +14,36 @@ changes bump the minor version and are called out under **Migration** below.
 - If the gentletask logger is set to DEBUG or lower, add a bunch of extra logging
   to help trace task relationships.
 
+### Fixed
+
+- **A child whose `stop()` fails no longer derails the cascade or its parent.**
+  Stopping a child is a request made of that child, not part of the requester's
+  own work, so a failure there is now logged at ERROR (with traceback, naming
+  the child) and the cascade continues. Previously the exception propagated: the
+  siblings after the failing child went un-stopped, and where the cascade runs
+  from a parent's `finally` block — `ThreadTask._run`, `MultiTask.stop`, the
+  `WorkerThread` runner — it also skipped the parent's own completion, so the
+  parent never finished and every waiter on it blocked forever. A device proxy
+  whose `stop()` raised on an unreachable device was enough to strand a whole
+  task tree.
+- **A hostile child no longer strands the cascade.** The guard covers the whole
+  per-child body, not just the `stop()` call: the cascade reads `child.is_done`
+  and formats a log line first, and a hand-rolled `Task` can make either raise.
+  Previously that aborted the loop before the guarded call, stranding every
+  sibling behind it — and in the `WorkerThread` runner it also killed the pump,
+  which left the worker accepting jobs it would never run while `submit()` went
+  on handing out tasks whose `wait()` blocked forever.
+- Those completion sites now complete their task from a `finally`, so "a started
+  task always completes" no longer depends on the stop cascade being
+  exception-free. `MultiTask.stop` and `ManualTask.stop` extend that guard over
+  `super().stop()` as well, since it runs the stop callbacks and the `_children`
+  cascade: a callback raising `BaseException` escapes its own guard, and that
+  must not cost the task its completion.
+- `stop()` no longer requires the task that called it to have a `_name`. With
+  DEBUG logging on, the line naming the requester read the attribute bare, so a
+  hand-rolled `Task` as `current_task()` raised `AttributeError` out of `stop()`
+  — taking the self-completion with it.
+
 ## [0.7.0] - 2026-07-03
 
 ### Added
