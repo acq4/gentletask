@@ -775,20 +775,27 @@ class TestGarbageCollection:
         outcome = []
 
         def body():
-            sleep(0.3)  # stop-aware: raises Stopped if the task is stopped
+            # time.sleep, not gentletask.sleep: every stop-aware primitive opens
+            # with current_task() and parks a strong reference in a live frame
+            # for the whole call, which is the very anchor this test must do
+            # without. The price is a body that ignores a stop, so collection is
+            # caught by the weakref below and a __del__ stop by the stop
+            # callback -- never by the body raising.
+            time.sleep(0.3)
             outcome.append("completed")
 
         def spawn():
-            # Build and drop the task inside a frame that goes away, so no
-            # local in the test function keeps it alive. The body deliberately
-            # does not call current_task(), which would itself hold a
-            # reference and mask the property under test.
+            # Build and drop the task inside a frame that goes away, so no local
+            # in the test function keeps it alive. The stop callback points the
+            # other way -- the task holds it, not it the task -- so it reports a
+            # __del__ stop without anchoring what it watches.
             t = ThreadTask(
                 body,
                 name="gc-victim",
                 detach=True,
                 on_finish=lambda r, e: outcome.append("ok" if e is None else type(e).__name__),
             )
+            t.add_stop_callback(lambda: outcome.append("stopped"))
             return weakref.ref(t)
 
         ref = spawn()
