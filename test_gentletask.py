@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import pickle
 import threading
 import time
+import weakref
 
 import queue as _queue
 import pytest
@@ -756,6 +758,107 @@ class TestThreadTaskStop:
         del t
         time.sleep(0.05)
         assert exc_ref[0] is None  # finished normally; __del__ stop() was a no-op
+
+
+class TestGarbageCollection:
+    """__del__ stops an unwaited task, so what keeps a *running* task alive matters.
+
+    Fire-and-forget callers (a best-effort abort fan-out, say) start a task and
+    keep no reference to it. That is only safe because a started task cannot be
+    collected while its thread runs; if it could, __del__ would stop the work
+    mid-flight.
+
+    The retention is structural to this module, not an accident of CPython: the
+    thread is launched on ``args=(self._run,)``, and _run immediately enters
+    ``task_context(self, ...)``, which pushes the task onto _task_stack inside
+    the thread's copied Context. Both links live in the running thread, so the
+    task stays reachable for as long as the body runs, no matter who else has
+    dropped it. Detachment does not enter into it — a parent's _children is a
+    WeakSet, so no parent ever kept a child alive either.
+    """
+
+    def test_running_task_is_not_collected_when_all_references_are_dropped(self):
+        outcome = []
+        running = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def body():
+            # Plain threading primitives, never gentletask's: every stop-aware
+            # primitive opens with current_task() and parks a strong reference
+            # in a live frame for its whole call, which is the very anchor this
+            # test must do without. The price is a body that ignores a stop, so
+            # collection is caught by the weakref below and a __del__ stop by
+            # the stop callback — never by the body raising.
+            running.set()
+            release.wait(5.0)
+            outcome.append("completed")
+
+        def on_finish(result, exc):
+            outcome.append("ok" if exc is None else type(exc).__name__)
+            finished.set()
+
+        def spawn():
+            # Build and drop the task inside a frame that goes away, so no local
+            # in the test function keeps it alive. The stop callback points the
+            # other way — the task holds it, not it the task — so it reports a
+            # __del__ stop without anchoring what it watches.
+            t = ThreadTask(body, name="gc-victim", on_finish=on_finish)
+            t.add_stop_callback(lambda: outcome.append("stopped"))
+            return weakref.ref(t)
+
+        ref = spawn()
+        # The body is held mid-flight rather than timed: the liveness claim is
+        # about a *running* task, and a sleeping one would hand a slow collect
+        # or a loaded box a finished task to collect legitimately.
+        assert running.wait(1.0), "task body never started"
+        gc.collect()
+        alive = ref() is not None
+        release.set()
+        assert alive, "running ThreadTask was collected; __del__ would stop it mid-flight"
+        assert finished.wait(1.0), "task never finished"
+        assert outcome == ["completed", "ok"]
+
+    def test_task_is_already_finished_by_the_time_it_is_collected(self):
+        # The load-bearing ordering, and the reason __del__ is harmless here:
+        # _run's finally calls _finish BEFORE the frame holding the task dies,
+        # so whenever the last reference does drop, is_done is already True and
+        # __del__ is a no-op. Complete the task after the frame unwinds instead
+        # and the mid-flight stop this class is about becomes reachable again.
+        events = []
+        finished = threading.Event()
+
+        def on_finish(result, exc):
+            events.append("finished")
+            finished.set()
+
+        def spawn():
+            t = ThreadTask(lambda: None, name="gc-ordering", on_finish=on_finish)
+            # finalize observes collection without holding the task, so this
+            # records the order of the two events rather than disturbing it.
+            weakref.finalize(t, events.append, "collected")
+            return weakref.ref(t)
+
+        ref = spawn()
+        assert finished.wait(1.0), "task never finished"
+        # Retried to let the thread unwind out of _run, not because collection
+        # needs more than one pass.
+        deadline = time.monotonic() + 1.0
+        while ref() is not None and time.monotonic() < deadline:
+            gc.collect()
+        assert ref() is None, "finished task was never collected"
+        assert events == ["finished", "collected"]
+
+    def test_del_stops_a_task_that_was_never_started(self):
+        # The complementary case: with start=False nothing external holds the
+        # task, so dropping it does reach __del__ and does stop the task. This
+        # is the situation __del__ exists for.
+        stopped = []
+        t = ThreadTask(lambda: sleep(5), name="never-started", start=False)
+        t.add_stop_callback(lambda: stopped.append(True))
+        del t
+        gc.collect()
+        assert stopped == [True]
 
 
 class TestStopWait:
