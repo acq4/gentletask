@@ -9,6 +9,8 @@ changes bump the minor version and are called out under **Migration** below.
 
 ## Unreleased
 
+## [0.7.1] - 2026-10-22
+
 ### Added
 
 - If the gentletask logger is set to DEBUG or lower, add a bunch of extra logging
