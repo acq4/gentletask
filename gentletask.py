@@ -852,7 +852,9 @@ class _TaskCore:
                 if _logger.isEnabledFor(logging.DEBUG):
                     requester = current_task()
                     requester_desc = (
-                        f"task {requester._name!r}" if requester is not None else "non-task caller"
+                        f"task {getattr(requester, '_name', requester)!r}"
+                        if requester is not None
+                        else "non-task caller"
                     )
                     _logger.debug(
                         "Task %r stop requested (reason: %r) by %s; call site:\n%s",
@@ -1016,19 +1018,34 @@ class _TaskCore:
             children = list(self._children)
             reason = self._stop_reason
         for child in children:
-            if not child.is_done:
-                # A finishing parent stops its still-running children. This is a
-                # common source of surprising "stopped for no reason" cascades
-                # (e.g. a child task constructed inside the parent's finish
-                # callback), so name both tasks and the reason.
-                if _logger.isEnabledFor(logging.DEBUG):
-                    _logger.debug(
-                        "Task %r finished; stopping still-running child task %r (reason: %r)",
-                        self._name,
-                        getattr(child, "_name", child),
-                        reason,
-                    )
-                _stop_child(child, reason)
+            # The guard wraps the whole body, not just the stop() call that
+            # _stop_child already protects: reading is_done and formatting the
+            # log line below both run arbitrary child code first, so a hostile
+            # Task could otherwise abort the loop before the guarded call and
+            # strand every sibling behind it.
+            try:
+                if not child.is_done:
+                    # A finishing parent stops its still-running children. This is a
+                    # common source of surprising "stopped for no reason" cascades
+                    # (e.g. a child task constructed inside the parent's finish
+                    # callback), so name both tasks and the reason.
+                    if _logger.isEnabledFor(logging.DEBUG):
+                        _logger.debug(
+                            "Task %r finished; stopping still-running child task %r (reason: %r)",
+                            self._name,
+                            getattr(child, "_name", child),
+                            reason,
+                        )
+                    _stop_child(child, reason)
+            except Exception:
+                # Exception, not BaseException: as in _stop_child, a
+                # KeyboardInterrupt or SystemExit here is not this child's
+                # failure and still propagates.
+                _logger.exception(
+                    "Task %r raised before it could be stopped; "
+                    "continuing the cascade without it",
+                    getattr(child, "_name", child),
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1118,10 +1135,10 @@ class ThreadTask(_TaskCore):
             except BaseException as e:
                 exc = e
             finally:
-                # try/finally, even though _stop_child swallows a child's own
-                # failure: the cascade also reads child.is_done and formats a
-                # log line, so a hostile Task implementation can still raise
-                # here. Completing this task is not allowed to depend on that.
+                # try/finally, even though the cascade swallows a child's
+                # own failure: a child is still free to raise BaseException,
+                # which the cascade deliberately lets through. Completing this
+                # task is not allowed to depend on that.
                 try:
                     self._stop_running_children()
                 finally:
@@ -1343,8 +1360,13 @@ class ManualTask(_TaskCore):
         ``wait=True`` just re-raises a non-``Stopped`` failure (e.g. a stop
         callback that failed the task) once it is done.
         """
-        super().stop(reason)
-        self._finish(exc=_stopped(self._stop_reason))
+        try:
+            super().stop(reason)
+        finally:
+            # As in MultiTask.stop: self-completion is what keeps this task's
+            # waiters from hanging, so it cannot depend on super().stop()
+            # returning.
+            self._finish(exc=_stopped(self._stop_reason))
         if wait:
             self._wait_for_stop_exit()
 
@@ -1481,13 +1503,16 @@ class MultiTask(_TaskCore):
         # self.is_stopped to report a single Stopped rather than aggregating the
         # children's Stoppeds into a MultiException. super().stop() also records
         # the reason and fires our stop callbacks.
-        super().stop(reason)
         try:
+            super().stop(reason)
             for t in self._tasks:
                 _stop_child(t, reason)
         finally:
             # Self-completion is what keeps this task's waiters from hanging, so
-            # it must happen even if the cascade above raised.
+            # it must happen even if the cascade above raised. super().stop() is
+            # inside the guard too: it runs our stop callbacks and the _children
+            # cascade, and a callback raising BaseException escapes its own
+            # guard -- which must not cost this task its completion.
             self._finish(exc=_stopped(self._stop_reason))
         if wait:
             self._wait_for_stop_exit()

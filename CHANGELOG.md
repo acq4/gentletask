@@ -26,11 +26,23 @@ changes bump the minor version and are called out under **Migration** below.
   parent never finished and every waiter on it blocked forever. A device proxy
   whose `stop()` raised on an unreachable device was enough to strand a whole
   task tree.
-- Those three completion sites now complete their task from a `finally`, so
-  "a started task always completes" no longer depends on the stop cascade being
-  exception-free. The cascade also reads `child.is_done` and formats a log line,
-  either of which a hand-rolled `Task` can make raise; such a failure still
-  surfaces, but only after the task has completed.
+- **A hostile child no longer strands the cascade.** The guard covers the whole
+  per-child body, not just the `stop()` call: the cascade reads `child.is_done`
+  and formats a log line first, and a hand-rolled `Task` can make either raise.
+  Previously that aborted the loop before the guarded call, stranding every
+  sibling behind it — and in the `WorkerThread` runner it also killed the pump,
+  which left the worker accepting jobs it would never run while `submit()` went
+  on handing out tasks whose `wait()` blocked forever.
+- Those completion sites now complete their task from a `finally`, so "a started
+  task always completes" no longer depends on the stop cascade being
+  exception-free. `MultiTask.stop` and `ManualTask.stop` extend that guard over
+  `super().stop()` as well, since it runs the stop callbacks and the `_children`
+  cascade: a callback raising `BaseException` escapes its own guard, and that
+  must not cost the task its completion.
+- `stop()` no longer requires the task that called it to have a `_name`. With
+  DEBUG logging on, the line naming the requester read the attribute bare, so a
+  hand-rolled `Task` as `current_task()` raised `AttributeError` out of `stop()`
+  — taking the self-completion with it.
 
 ## [0.7.0] - 2026-07-03
 
